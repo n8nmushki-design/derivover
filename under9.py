@@ -40,8 +40,11 @@ from websocket import (
 )
 
 # ======================= CONFIG =======================
-APP_ID = os.environ.get("DERIV_APP_ID", "34CtuujwUQPcjQL4fFDBO")
-TOKEN  = os.environ.get("DERIV_TOKEN",  "‎pat_27473f73804a377d93a852cacba6f08614eae6289b32b853cf9c0b65716b6c2b")
+APP_ID = os.environ.get("DERIV_APP_ID")
+TOKEN  = os.environ.get("DERIV_TOKEN")
+
+if not APP_ID or not TOKEN:
+    raise ValueError("Missing DERIV_APP_ID or DERIV_TOKEN environment variables")
 
 ACCOUNT_TYPE      = "demo"          # "demo" or "real"
 TRADING_ENABLED   = True
