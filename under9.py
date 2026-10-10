@@ -1,38 +1,20 @@
 #!/usr/bin/env python3
 """
-Deriv Digit Over / Under bot – New Deriv API (App ID + pat_ token + OTP)
-
-Two strategies
---------------
-1. OVER  (default) – “Over 0 strategy”
-   • DIGITOVER
-   • Barriers on loss : 0 → 5 → 5 → 6 → 6 → 7 → 7 → 8 → 8
-   • Filter           : recent frequency of digits 0 and 1 < 10 %
-   • On WIN           : reset barrier to 0 and continue
-
-2. UNDER (activated after 5 consecutive “no-match” scans)
-   • DIGITUNDER
-   • Barriers on loss : 9 → 5 → 5 → 4 → 4 → 3 → 3 → 2 → 2 → 1 → 1
-   • Filter           : recent frequency of digits 8 and 9 < 10 %
-   • On WIN           : reset barrier to 9 and continue
-
-Common settings
----------------
-• Stake $1, duration 1 tick
-• Stop-loss $3, take-profit $7.50
-• Scans all listed volatility indices
-• Switches back and forth after 5 failed scans each
-
-Install:  pip install websocket-client
+Deriv Digit Over / Under bot – Render-ready version
+- Runs the trading bot in a background thread
+- Exposes a clean web UI on the port required by Render
 """
 
 import json
 import os
 import time
+import threading
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
+from datetime import datetime
 
+from flask import Flask, jsonify, render_template_string
 from websocket import (
     create_connection,
     WebSocketTimeoutException,
@@ -56,13 +38,11 @@ MAX_TRADES        = 50
 STOP_LOSS         = 3.0
 TAKE_PROFIT       = 7.5
 
-# ----- Strategy definitions -----
 OVER_BARRIERS  = [0, 5, 5, 6, 6, 7, 7, 8, 8]
 UNDER_BARRIERS = [9, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1]
 
-# How many consecutive “no eligible market” checks before switching strategy
 NO_MATCH_LIMIT   = 5
-MODE_CHECK_SECS  = 8            # check eligibility every N seconds
+MODE_CHECK_SECS  = 8
 
 CANDIDATE_SYMBOLS = [
     "R_10", "R_25", "R_50", "R_75", "R_100",
@@ -70,9 +50,7 @@ CANDIDATE_SYMBOLS = [
 ]
 
 DIGIT_WINDOW         = 100
-# Over filter: frequency of digits 0 and 1 combined
 MAX_01_FREQUENCY     = 0.10
-# Under filter: frequency of digits 8 and 9 combined
 MAX_89_FREQUENCY     = 0.10
 MIN_TICKS_FOR_FILTER = 50
 # ======================================================
@@ -171,7 +149,7 @@ def last_digit(price) -> int:
 
 class Bot:
     def __init__(self):
-        self.mode            = "over"          # "over" or "under"
+        self.mode            = "over"
         self.barrier_idx     = 0
         self.trades          = 0
         self.pending         = False
@@ -186,8 +164,10 @@ class Bot:
         self.last_status     = {}
         self.no_match_streak = 0
         self.last_mode_check = 0.0
+        self.last_message    = "Bot starting..."
+        self.running         = False
+        self.started_at      = None
 
-    # ---------- mode helpers ----------
     def barriers(self):
         return OVER_BARRIERS if self.mode == "over" else UNDER_BARRIERS
 
@@ -202,27 +182,28 @@ class Bot:
         self.mode = "under" if self.mode == "over" else "over"
         self.barrier_idx = 0
         self.no_match_streak = 0
-        print(f"\n*** SWITCHED STRATEGY: {old.upper()} → {self.mode.upper()} ***")
-        print(f"    New barriers: {self.barriers()}")
-        print(f"    Contract    : {self.contract_type()}\n")
+        msg = f"SWITCHED STRATEGY: {old.upper()} → {self.mode.upper()}"
+        print(f"\n*** {msg} ***")
+        self.last_message = msg
 
     def on_win(self):
         first = self.barriers()[0]
-        print(f"  → WIN – prediction reset to {first}  (continue)")
+        print(f"  → WIN – prediction reset to {first}")
         self.barrier_idx = 0
+        self.last_message = f"WIN – reset to barrier {first}"
 
     def on_loss(self):
         blist = self.barriers()
         if self.barrier_idx < len(blist) - 1:
             self.barrier_idx += 1
             print(f"  → LOSS – next prediction = {self.current_barrier()}")
+            self.last_message = f"LOSS – next barrier {self.current_barrier()}"
         else:
             print(f"  → LOSS – end of list, reset to {blist[0]}")
             self.barrier_idx = 0
+            self.last_message = f"LOSS – reset to {blist[0]}"
 
-    # ---------- frequency filters ----------
     def digit_freq(self, symbol: str, digits) -> float | None:
-        """Return frequency of the given digits in the recent window."""
         hist = self.digit_history[symbol]
         if len(hist) < MIN_TICKS_FOR_FILTER:
             return None
@@ -231,11 +212,9 @@ class Bot:
 
     def is_eligible(self, symbol: str) -> bool:
         if self.mode == "over":
-            # Over 0 strategy: frequency of 0 and 1 combined must be < 10 %
             freq = self.digit_freq(symbol, (0, 1))
             return freq is not None and freq < MAX_01_FREQUENCY
         else:
-            # Under 9 strategy: frequency of 8 and 9 combined must be < 10 %
             freq = self.digit_freq(symbol, (8, 9))
             return freq is not None and freq < MAX_89_FREQUENCY
 
@@ -262,16 +241,15 @@ class Bot:
 
         if self.mode == "over":
             freq = self.digit_freq(symbol, (0, 1))
-            label = f"P(0 and 1)={freq*100:.1f}%"
+            label = f"P(0+1)={freq*100:.1f}%"
         else:
             freq = self.digit_freq(symbol, (8, 9))
-            label = f"P(8 and 9)={freq*100:.1f}%"
+            label = f"P(8+9)={freq*100:.1f}%"
 
-        print(f"\n★ ELIGIBLE {symbol}  {label}  "
-              f"→ {ctype} barrier={barrier} @ {price}")
+        print(f"\n★ ELIGIBLE {symbol}  {label}  → {ctype} barrier={barrier}")
+        self.last_message = f"Trading {symbol} {ctype} barrier={barrier}"
 
         if not TRADING_ENABLED:
-            print("  [signals only] TRADING_ENABLED=False")
             return
 
         self.pending = True
@@ -288,7 +266,6 @@ class Bot:
         }))
 
     def maybe_switch_mode(self):
-        """Called periodically. After NO_MATCH_LIMIT consecutive failures → switch."""
         now = time.time()
         if now - self.last_mode_check < MODE_CHECK_SECS:
             return
@@ -308,12 +285,12 @@ class Bot:
         if "error" in msg:
             err = msg["error"]
             print("API error:", err.get("message") or err)
+            self.last_message = f"API error: {err.get('message') or err}"
             self.pending = False
             return
 
         t = msg.get("msg_type")
 
-        # ---- tick ----
         if t == "tick" or "tick" in msg:
             tick = msg.get("tick") or msg
             symbol = (tick.get("symbol") or
@@ -327,20 +304,15 @@ class Bot:
             digit = last_digit(price)
             self.digit_history[symbol].append(digit)
             self.ticks_seen += 1
-
-            # periodic mode-switch check
             self.maybe_switch_mode()
 
-            # status logging
             eligible = self.is_eligible(symbol)
             if self.mode == "over":
                 freq = self.digit_freq(symbol, (0, 1))
-                freq_str = (f"P(0 and 1)={freq*100:5.1f}%"
-                            if freq is not None else "collecting")
+                freq_str = (f"P(0+1)={freq*100:5.1f}%" if freq is not None else "collecting")
             else:
                 freq = self.digit_freq(symbol, (8, 9))
-                freq_str = (f"P(8 and 9)={freq*100:5.1f}%"
-                            if freq is not None else "collecting")
+                freq_str = (f"P(8+9)={freq*100:5.1f}%" if freq is not None else "collecting")
 
             status_key = (symbol, eligible, self.mode,
                           round(freq or -1, 3) if freq is not None else None)
@@ -353,7 +325,6 @@ class Bot:
 
             self.try_trade(ws, symbol, price)
 
-        # ---- balance ----
         elif t == "balance" or "balance" in msg:
             b = msg.get("balance")
             if isinstance(b, dict):
@@ -377,11 +348,12 @@ class Bot:
                 if profit <= -STOP_LOSS:
                     print(f"Stop-loss ${STOP_LOSS} hit – stopping.")
                     self.stop = True
+                    self.last_message = f"Stop-loss hit (${STOP_LOSS})"
                 elif profit >= TAKE_PROFIT:
                     print(f"Take-profit ${TAKE_PROFIT} hit – stopping.")
                     self.stop = True
+                    self.last_message = f"Take-profit hit (${TAKE_PROFIT})"
 
-        # ---- proposal → buy ----
         elif t == "proposal":
             prop = msg.get("proposal") or {}
             prop_id = prop.get("id")
@@ -390,12 +362,8 @@ class Bot:
                 self.pending = False
                 return
             print(f"  Proposal OK – buying id={prop_id}")
-            ws.send(json.dumps({
-                "buy": prop_id,
-                "price": STAKE,
-            }))
+            ws.send(json.dumps({"buy": prop_id, "price": STAKE}))
 
-        # ---- buy confirmation ----
         elif t == "buy":
             buy = msg.get("buy") or {}
             contract_id = buy.get("contract_id")
@@ -405,6 +373,7 @@ class Bot:
             self.open_contract = contract_id
             print(f"Trade #{self.trades} placed  ({self.mode.upper()})  "
                   f"contract_id={contract_id}  barrier={self.current_barrier()}")
+            self.last_message = f"Trade #{self.trades} placed ({self.mode.upper()})"
 
             if contract_id:
                 ws.send(json.dumps({
@@ -413,7 +382,6 @@ class Bot:
                     "subscribe": 1,
                 }))
 
-        # ---- contract result ----
         elif t == "proposal_open_contract":
             poc = msg.get("proposal_open_contract") or {}
             if not (poc.get("is_sold") or poc.get("status") == "sold"):
@@ -442,6 +410,7 @@ def run_session(bot: Bot):
     ws  = create_connection(url, timeout=15, header=["User-Agent: " + UA])
     ws.settimeout(10)
     print("Connected.")
+    bot.last_message = "Connected to Deriv"
 
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
 
@@ -451,12 +420,6 @@ def run_session(bot: Bot):
 
     print(f"\nMode: {ACCOUNT_TYPE} | trading={'ON' if TRADING_ENABLED else 'OFF'}")
     print(f"Starting strategy: OVER (Over 0)")
-    print(f"  OVER  barriers: {OVER_BARRIERS}")
-    print(f"         filter : P(0 and 1) < 10 %")
-    print(f"  UNDER barriers: {UNDER_BARRIERS}")
-    print(f"         filter : P(8 and 9) < 10 %")
-    print(f"Switch after {NO_MATCH_LIMIT} consecutive no-match checks "
-          f"(every {MODE_CHECK_SECS}s)")
     print(f"Stop-loss ${STOP_LOSS} | Take-profit ${TAKE_PROFIT}\n")
 
     last_ping    = time.time()
@@ -484,28 +447,27 @@ def run_session(bot: Bot):
         except Exception:
             pass
 
-def main():
-    if "PASTE_" in APP_ID or "PASTE_" in TOKEN:
-        print("Edit APP_ID and TOKEN first (or set env vars).")
-        return
-
-    bot   = Bot()
+def bot_runner(bot: Bot):
+    """Background thread that keeps the trading bot alive."""
+    bot.running = True
+    bot.started_at = datetime.utcnow().isoformat() + "Z"
     delay = 3
 
     while not bot.stop:
         try:
             run_session(bot)
             delay = 3
-        except KeyboardInterrupt:
-            print("\nStopped by user.")
-            return
         except ConfigError as e:
             print("Login problem:", e)
+            bot.last_message = f"Login problem: {e}"
+            bot.stop = True
             return
         except (WebSocketConnectionClosedException, ConnectionError, OSError) as e:
             print("Connection lost:", e)
+            bot.last_message = f"Connection lost: {e}"
         except Exception as e:
             print("Error:", e)
+            bot.last_message = f"Error: {e}"
 
         if bot.stop:
             break
@@ -513,7 +475,147 @@ def main():
         time.sleep(delay)
         delay = min(delay * 2, 60)
 
+    bot.running = False
     print("Bot finished.")
+    bot.last_message = "Bot stopped"
 
-if __name__ == "__main__":
-    main()
+# ======================= Flask App =======================
+app = Flask(__name__)
+bot_instance = Bot()
+bot_thread = None
+
+HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deriv Digit Bot</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .container { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 1.75rem; margin-bottom: 8px; }
+    .subtitle { color: var(--muted); margin-bottom: 28px; }
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 16px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+    .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .value { font-size: 1.25rem; font-weight: 600; margin-top: 4px; }
+    .status-dot {
+      display: inline-block;
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      margin-right: 8px;
+    }
+    .online { background: var(--green); }
+    .offline { background: var(--red); }
+    .btn {
+      display: inline-block;
+      padding: 10px 20px;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-right: 10px;
+      margin-top: 8px;
+      text-decoration: none;
+      color: white;
+    }
+    .btn-start { background: var(--green); }
+    .btn-stop  { background: var(--red); }
+    .btn-refresh { background: #334155; }
+    .msg {
+      margin-top: 16px;
+      padding: 12px 16px;
+      background: #0f172a;
+      border-radius: 8px;
+      font-family: ui-monospace, monospace;
+      font-size: 0.9rem;
+      color: var(--accent);
+    }
+    footer { margin-top: 32px; color: var(--muted); font-size: 0.8rem; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Deriv Digit Over / Under</h1>
+    <p class="subtitle">Live status of your trading bot</p>
+
+    <div class="card">
+      <div style="margin-bottom: 16px;">
+        <span class="status-dot {{ 'online' if running else 'offline' }}"></span>
+        <strong>{{ 'Running' if running else 'Stopped' }}</strong>
+      </div>
+
+      <div class="grid">
+        <div>
+          <div class="label">Mode</div>
+          <div class="value">{{ mode|upper }}</div>
+        </div>
+        <div>
+          <div class="label">Barrier</div>
+          <div class="value">{{ barrier }}</div>
+        </div>
+        <div>
+          <div class="label">Trades</div>
+          <div class="value">{{ trades }}</div>
+        </div>
+        <div>
+          <div class="label">Ticks seen</div>
+          <div class="value">{{ ticks }}</div>
+        </div>
+        <div>
+          <div class="label">Balance</div>
+          <div class="value">
+            {% if balance is not none %}
+              {{ '%.2f'|format(balance) }} {{ currency }}
+            {% else %}
+              —
+            {% endif %}
+          </div>
+        </div>
+        <div>
+          <div class="label">P/L</div>
+          <div class="value" style="color: {{ '#22c55e' if profit and profit >= 0 else '#ef4444' }}">
+            {% if profit is not none %}
+              {{ '%+.2f'|format(profit) }}
+            {% else %}
+              —
+            {% endif %}
+          </div>
+        </div>
+      </div>
+
+      <div class="msg">{{ last_message }}</div>
+
+      <div style="margin-top: 20px;">
+        <a class="btn btn-start" href="/start">Start Bot</a>
+        <a class="btn btn-stop"  href="/stop">Stop Bot</a>
+        
