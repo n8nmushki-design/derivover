@@ -618,4 +618,74 @@ HTML = """
       <div style="margin-top: 20px;">
         <a class="btn btn-start" href="/start">Start Bot</a>
         <a class="btn btn-stop"  href="/stop">Stop Bot</a>
-        
+        <a class="btn btn-refresh" href="/">Refresh</a>
+      </div>
+    </div>
+
+    <footer>
+      Started: {{ started_at or '—' }} · Account: {{ account_type }}
+    </footer>
+  </div>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    b = bot_instance
+    profit = None
+    if b.balance is not None and b.start_balance is not None:
+        profit = b.balance - b.start_balance
+    return render_template_string(
+        HTML,
+        running=b.running,
+        mode=b.mode,
+        barrier=b.current_barrier(),
+        trades=b.trades,
+        ticks=b.ticks_seen,
+        balance=b.balance,
+        currency=b.currency,
+        profit=profit,
+        last_message=b.last_message,
+        started_at=b.started_at,
+        account_type=ACCOUNT_TYPE,
+    )
+
+@app.route("/start")
+def start_bot():
+    global bot_thread
+    if bot_instance.running:
+        return jsonify({"ok": False, "msg": "Bot already running"}), 400
+    bot_instance.stop = False
+    bot_thread = threading.Thread(target=bot_runner, args=(bot_instance,), daemon=True)
+    bot_thread.start()
+    return jsonify({"ok": True, "msg": "Bot started"})
+
+@app.route("/stop")
+def stop_bot():
+    bot_instance.stop = True
+    return jsonify({"ok": True, "msg": "Stop signal sent"})
+
+@app.route("/status")
+def status():
+    b = bot_instance
+    profit = None
+    if b.balance is not None and b.start_balance is not None:
+        profit = b.balance - b.start_balance
+    return jsonify({
+        "running": b.running,
+        "mode": b.mode,
+        "barrier": b.current_barrier(),
+        "trades": b.trades,
+        "ticks": b.ticks_seen,
+        "balance": b.balance,
+        "currency": b.currency,
+        "profit": profit,
+        "last_message": b.last_message,
+        "started_at": b.started_at,
+    })
+
+if __name__ == "__main__":
+    # Local development only; Render uses gunicorn under9:app
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
