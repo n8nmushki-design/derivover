@@ -441,76 +441,53 @@ def run_session(bot: Bot):
     print("Connected.")
 
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+#!/usr/bin/env python3
+"""
+Deriv Digit Over / Under bot – New Deriv API (App ID + pat_ token + OTP)
 
-    for sym in CANDIDATE_SYMBOLS:
-        ws.send(json.dumps({"ticks": sym, "subscribe": 1}))
-        print(f"  subscribed: {sym}")
+Two strategies
+--------------
+1. OVER  (default) – “Over 0 strategy”
+   • DIGITOVER
+   • Barriers on loss : 0 → 5 → 5 → 6 → 6 → 7 → 7 → 8 → 8
+   • Filter           : recent frequency of digits 0 and 1 < 10 %
+   • On WIN           : reset barrier to 0 and continue
 
-    print(f"\nMode: {ACCOUNT_TYPE} | trading={'ON' if TRADING_ENABLED else 'OFF'}")
-    print(f"Starting strategy: OVER (Over 0)")
-    print(f"  OVER  barriers: {OVER_BARRIERS}")
-    print(f"         filter : P(0 and 1) < 10 %")
-    print(f"  UNDER barriers: {UNDER_BARRIERS}")
-    print(f"         filter : P(8 and 9) < 10 %")
-    print(f"Switch after {NO_MATCH_LIMIT} consecutive no-match checks "
-          f"(every {MODE_CHECK_SECS}s)")
-    print(f"Stop-loss ${STOP_LOSS} | Take-profit ${TAKE_PROFIT}\n")
+2. UNDER (activated after 5 consecutive “no-match” scans)
+   • DIGITUNDER
+   • Barriers on loss : 9 → 5 → 5 → 4 → 4 → 3 → 3 → 2 → 2 → 1 → 1
+   • Filter           : recent frequency of digits 8 and 9 < 10 %
+   • On WIN           : reset barrier to 9 and continue
 
-    last_ping    = time.time()
-    last_balance = time.time()
+Common settings
+---------------
+• Stake $1, duration 1 tick
+• Stop-loss $3, take-profit $7.50
+• Scans all listed volatility indices
+• Switches back and forth after 5 failed scans each
 
-    try:
-        while not bot.stop:
-            now = time.time()
-            if now - last_ping > 25:
-                ws.send(json.dumps({"ping": 1}))
-                last_ping = now
-            if now - last_balance > 45:
-                ws.send(json.dumps({"balance": 1}))
-                last_balance = now
+Install:  pip install websocket-client
+"""
 
-            try:
-                raw = ws.recv()
-            except WebSocketTimeoutException:
-                continue
-            if raw:
-                bot.handle(ws, json.loads(raw))
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
+from __future__ import annotations
 
-def main():
-    if "PASTE_" in APP_ID or "PASTE_" in TOKEN:
-        print("Edit APP_ID and TOKEN first (or set env vars).")
-        return
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import defaultdict, deque
 
-    bot   = Bot()
-    delay = 3
+from websocket import (
+    create_connection,
+    WebSocketTimeoutException,
+    WebSocketConnectionClosedException,
+)
 
-    while not bot.stop:
-        try:
-            run_session(bot)
-            delay = 3
-        except KeyboardInterrupt:
-            print("\nStopped by user.")
-            return
-        except ConfigError as e:
-            print("Login problem:", e)
-            return
-        except (WebSocketConnectionClosedException, ConnectionError, OSError) as e:
-            print("Connection lost:", e)
-        except Exception as e:
-            print("Error:", e)
+# ======================= CONFIG =======================
+# Credentials come from the environment only – never commit them.
+#   export DERIV_APP_ID=...   export DERIV_TOKEN=pat_...
+APP_ID = os.environ.get("DERIV_APP_ID", "")
+TOKEN  = os.environ.get("DERIV_TOKEN", "")
 
-        if bot.stop:
-            break
-        print(f"Reconnecting in {delay}s …\n")
-        time.sleep(delay)
-        delay = min(delay * 2, 60)
-
-    print("Bot finished.")
-
-if __name__ == "__main__":
-    main()
