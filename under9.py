@@ -526,6 +526,311 @@ HTML = """
     }
     @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
     .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .value { font-size: 1.25rem; font-weight: 600; margin-top: 4px; word-break: break-all; }
+    .status-dot {
+      display: inline-block;
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      margin-right: 8px;
+    }
+    .online { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .offline { background: var(--red); }
+    .btn {
+      display: inline-block;
+      padding: 10px 20px;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-right: 10px;
+      margin-top: 8px;
+      color: white;
+    }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-start { background: var(--green); }
+    .btn-stop  { background: var(--red); }
+    .btn-refresh { background: #334155; }
+    .msg {
+      margin-top: 16px;
+      padding: 12px 16px;
+      background: #0f172a;
+      border-radius: 8px;
+      font-family: ui-monospace, monospace;
+      font-size: 0.9rem;
+      color: var(--accent);
+      min-height: 1.4em;
+      white-space: pre-wrap;
+    }
+    footer { margin-top: 24px; color: var(--muted); font-size: 0.8rem; text-align: center; }
+    .toast {
+      margin-top: 12px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      display: none;
+    }
+    .toast.ok { display: block; background: #14532d; color: #bbf7d0; }
+    .toast.err { display: block; background: #7f1d1d; color: #fecaca; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Deriv Digit Over / Under</h1>
+    <p class="subtitle">Live status of your trading bot</p>
+
+    <div class="card">
+      <div style="margin-bottom: 16px;">
+        <span id="status-dot" class="status-dot offline"></span>
+        <strong id="status-text">Stopped</strong>
+      </div>
+
+      <div class="grid">
+        <div>
+          <div class="label">Mode</div>
+          <div class="value" id="mode">—</div>
+        </div>
+        <div>
+          <div class="label">Barrier</div>
+          <div class="value" id="barrier">—</div>
+        </div>
+        <div>
+          <div class="label">Trades</div>
+          <div class="value" id="trades">0</div>
+        </div>
+        <div>
+          <div class="label">Ticks seen</div>
+          <div class="value" id="ticks">0</div>
+        </div>
+        <div>
+          <div class="label">Balance</div>
+          <div class="value" id="balance">—</div>
+        </div>
+        <div>
+          <div class="label">P/L</div>
+          <div class="value" id="profit">—</div>
+        </div>
+      </div>
+
+      <div class="msg" id="last-message">Loading…</div>
+
+      <div id="toast" class="toast"></div>
+
+      <div style="margin-top: 20px;">
+        <button class="btn btn-start" id="btn-start" onclick="stf freq is not None else "collecting")
+
+            status_key = (symbol, eligible, self.mode,
+                          round(freq or -1, 3) if freq is not None else None)
+            if (status_key != self.last_status.get(symbol) or
+                    self.ticks_seen % 40 == 0):
+                flag = "✓ READY" if eligible else "  skip "
+                print(f"[{self.mode.upper():5}] {symbol}: {price} d={digit}  "
+                      f"{freq_str}  {flag}  barrier={self.current_barrier()}")
+                self.last_status[symbol] = status_key
+
+            self.try_trade(ws, symbol, price)
+
+        elif t == "balance" or "balance" in msg:
+            b = msg.get("balance")
+            if isinstance(b, dict):
+                amount = b.get("balance", b.get("amount"))
+                self.currency = b.get("currency", self.currency)
+            else:
+                amount = b
+            try:
+                self.balance = float(amount)
+            except (TypeError, ValueError):
+                return
+
+            if self.start_balance is None:
+                self.start_balance = self.balance
+                print(f"Starting balance: {self.balance:.2f} {self.currency}")
+
+            profit = self.balance - self.start_balance
+            print(f"BALANCE: {self.balance:.2f} {self.currency}  (P/L {profit:+.2f})")
+
+            if TRADING_ENABLED:
+                if profit <= -STOP_LOSS:
+                    print(f"Stop-loss ${STOP_LOSS} hit – stopping.")
+                    self.stop = True
+                    self.last_message = f"Stop-loss hit (${STOP_LOSS})"
+                elif profit >= TAKE_PROFIT:
+                    print(f"Take-profit ${TAKE_PROFIT} hit – stopping.")
+                    self.stop = True
+                    self.last_message = f"Take-profit hit (${TAKE_PROFIT})"
+
+        elif t == "proposal":
+            prop = msg.get("proposal") or {}
+            prop_id = prop.get("id")
+            if not prop_id:
+                print("Proposal missing id:", json.dumps(msg)[:250])
+                self.pending = False
+                return
+            print(f"  Proposal OK – buying id={prop_id}")
+            ws.send(json.dumps({"buy": prop_id, "price": STAKE}))
+
+        elif t == "buy":
+            buy = msg.get("buy") or {}
+            contract_id = buy.get("contract_id")
+            self.trades += 1
+            self.pending = False
+            self.last_trade_ts = time.time()
+            self.open_contract = contract_id
+            print(f"Trade #{self.trades} placed  ({self.mode.upper()})  "
+                  f"contract_id={contract_id}  barrier={self.current_barrier()}")
+            self.last_message = f"Trade #{self.trades} placed ({self.mode.upper()})"
+
+            if contract_id:
+                ws.send(json.dumps({
+                    "proposal_open_contract": 1,
+                    "contract_id": contract_id,
+                    "subscribe": 1,
+                }))
+
+        elif t == "proposal_open_contract":
+            poc = msg.get("proposal_open_contract") or {}
+            if not (poc.get("is_sold") or poc.get("status") == "sold"):
+                return
+
+            profit = float(poc.get("profit", 0) or 0)
+            cid = poc.get("contract_id")
+            print(f"Contract {cid} closed  profit={profit:+.2f}")
+
+            if profit > 0:
+                self.on_win()
+            else:
+                self.on_loss()
+
+            self.open_contract = None
+
+        elif t in ("ping", "pong", "authorize", "time"):
+            pass
+        else:
+            if getattr(self, "_unknown", 0) < 3:
+                print("Other msg:", json.dumps(msg)[:200])
+                self._unknown = getattr(self, "_unknown", 0) + 1
+
+def run_session(bot: Bot):
+    url = get_ws_url()
+    ws  = create_connection(url, timeout=15, header=["User-Agent: " + UA])
+    ws.settimeout(10)
+    print("Connected.")
+    bot.last_message = "Connected to Deriv"
+
+    ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+
+    for sym in CANDIDATE_SYMBOLS:
+        ws.send(json.dumps({"ticks": sym, "subscribe": 1}))
+        print(f"  subscribed: {sym}")
+
+    print(f"\nMode: {ACCOUNT_TYPE} | trading={'ON' if TRADING_ENABLED else 'OFF'}")
+    print(f"Starting strategy: OVER (Over 0)")
+    print(f"Stop-loss ${STOP_LOSS} | Take-profit ${TAKE_PROFIT}\n")
+
+    last_ping    = time.time()
+    last_balance = time.time()
+
+    try:
+        while not bot.stop:
+            now = time.time()
+            if now - last_ping > 25:
+                ws.send(json.dumps({"ping": 1}))
+                last_ping = now
+            if now - last_balance > 45:
+                ws.send(json.dumps({"balance": 1}))
+                last_balance = now
+
+            try:
+                raw = ws.recv()
+            except WebSocketTimeoutException:
+                continue
+            if raw:
+                bot.handle(ws, json.loads(raw))
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+def bot_runner(bot: Bot):
+    """Background thread that keeps the trading bot alive."""
+    bot.running = True
+    bot.started_at = datetime.utcnow().isoformat() + "Z"
+    delay = 3
+
+    while not bot.stop:
+        try:
+            run_session(bot)
+            delay = 3
+        except ConfigError as e:
+            print("Login problem:", e)
+            bot.last_message = f"Login problem: {e}"
+            bot.stop = True
+            return
+        except (WebSocketConnectionClosedException, ConnectionError, OSError) as e:
+            print("Connection lost:", e)
+            bot.last_message = f"Connection lost: {e}"
+        except Exception as e:
+            print("Error:", e)
+            bot.last_message = f"Error: {e}"
+
+        if bot.stop:
+            break
+        print(f"Reconnecting in {delay}s …\n")
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
+
+    bot.running = False
+    print("Bot finished.")
+    bot.last_message = "Bot stopped"
+
+# ======================= Flask App =======================
+app = Flask(__name__)
+bot_instance = Bot()
+bot_thread = None
+
+HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deriv Digit Bot</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .container { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 1.75rem; margin-bottom: 8px; }
+    .subtitle { color: var(--muted); margin-bottom: 28px; }
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 16px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+    .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
     .value { font-size: 1.25rem; font-weight: 600; margin-top: 4px; }
     .status-dot {
       display: inline-block;
