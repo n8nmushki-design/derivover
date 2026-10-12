@@ -66,6 +66,8 @@ UNDER_BARRIERS = [9, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1]
 # How many consecutive “no eligible market” checks before switching strategy
 NO_MATCH_LIMIT   = 5
 MODE_CHECK_SECS  = 8            # check eligibility every N seconds
+PENDING_TIMEOUT  = 20           # give up on a trade request Deriv never answered (seconds)
+OPEN_CHECK_SECS  = 30           # re-check a contract that has not settled after this long
 
 CANDIDATE_SYMBOLS = [
     "R_10", "R_25", "R_50", "R_75", "R_100",
@@ -234,6 +236,8 @@ class Bot:
         self.balance_history = deque(maxlen=300)     # [timestamp, balance]
         self.last_price      = {}                    # symbol -> latest quote
         self.pending_trade   = None                  # trade waiting for its buy confirmation
+        self.pending_since   = 0.0
+        self.open_since      = 0.0
         self.stop_reason     = None
 
     # ---------- dashboard helpers ----------
@@ -423,6 +427,7 @@ class Bot:
             return
 
         self.pending = True
+        self.pending_since = time.time()
         self.pending_trade = {"symbol": symbol, "contract_type": ctype,
                               "barrier": int(barrier), "mode": self.mode}
         ws.send(json.dumps({
@@ -448,6 +453,13 @@ class Bot:
             self.no_match_streak = 0
             return
 
+        # Still collecting the first ticks everywhere: that is not a failed
+        # scan, so do not count it (otherwise a cold start switches to Under
+        # before Over has had any data to judge).
+        if not any(len(self.digit_history[s]) >= MIN_TICKS_FOR_FILTER
+                   for s in CANDIDATE_SYMBOLS):
+            return
+
         self.no_match_streak += 1
         print(f"  No eligible market for {self.mode.upper()} "
               f"(streak {self.no_match_streak}/{NO_MATCH_LIMIT})")
@@ -457,6 +469,20 @@ class Bot:
     def handle(self, ws, msg: dict):
         with self.lock:
             self._handle(ws, msg)
+
+    def watchdog(self, ws):
+        """Unstick the bot if Deriv never answers a request or a result is missed."""
+        now = time.time()
+        with self.lock:
+            if self.pending and now - self.pending_since > PENDING_TIMEOUT:
+                self.pending = False
+                self.pending_trade = None
+                self.note("warn", "Deriv did not answer a trade request in time, trying again")
+            cid = self.open_contract
+            if cid and now - self.open_since > OPEN_CHECK_SECS:
+                self.open_since = now
+                self.note("warn", "Trade result is late, asking Deriv for it")
+                ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": cid}))
 
     def _handle(self, ws, msg: dict):
         if "error" in msg:
@@ -546,6 +572,8 @@ class Bot:
 
         # ---- proposal → buy ----
         elif t == "proposal":
+            if not self.pending:
+                return          # late answer to a request that already timed out
             prop = msg.get("proposal") or {}
             prop_id = prop.get("id")
             if not prop_id:
@@ -567,6 +595,7 @@ class Bot:
             self.trades += 1
             self.pending = False
             self.last_trade_ts = time.time()
+            self.open_since = self.last_trade_ts
             self.open_contract = contract_id
             print(f"Trade #{self.trades} placed  ({self.mode.upper()})  "
                   f"contract_id={contract_id}  barrier={self.current_barrier()}")
@@ -685,6 +714,7 @@ def run_session(bot: Bot):
             if now - last_balance > 45:
                 ws.send(json.dumps({"balance": 1}))
                 last_balance = now
+            bot.watchdog(ws)
 
             try:
                 raw = ws.recv()
@@ -750,28 +780,106 @@ def main():
 # Running `python3 under9.py` directly does not need Flask.
 DASHBOARD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "dashboard.html")
-BOT     = Bot()
-_thread = None
-_lock   = threading.Lock()
+BOT         = Bot()
+_thread     = None
+_owner_pid  = None            # process that owns _thread (a forked copy does not)
+_lock       = threading.Lock()
+_keepalive  = None
+
+# Render's free tier sleeps a service after ~15 minutes without incoming web
+# traffic. Render sets RENDER_EXTERNAL_URL; the bot pings its own /health so it
+# keeps trading. Set KEEPALIVE=0 to turn this off (an uptime monitor also works).
+KEEPALIVE_SECS = 600
 
 def bot_running() -> bool:
-    return bool(_thread and _thread.is_alive() and not BOT.stop)
+    return bool(_thread and _thread.is_alive() and _owner_pid == os.getpid()
+                and not BOT.stop)
+
+def _keepalive_loop(url: str):
+    while True:
+        time.sleep(KEEPALIVE_SECS)
+        try:
+            with urllib.request.urlopen(url + "/health", timeout=20) as r:
+                r.read()
+        except Exception:
+            pass                      # a missed ping is harmless
 
 def start_background_bot() -> bool:
-    global _thread
+    global _thread, _owner_pid, _keepalive
     with _lock:
-        if _thread and _thread.is_alive():
+        mine = _owner_pid == os.getpid()
+        if _thread and _thread.is_alive() and mine:
             return False
         if not APP_ID or not TOKEN:
-            BOT.last_error = "Missing DERIV_APP_ID or DERIV_TOKEN"
-            print(BOT.last_error)
-            BOT.note("error", BOT.last_error)
+            msg = "Missing DERIV_APP_ID or DERIV_TOKEN"
+            if BOT.last_error != msg:         # report once, not on every request
+                BOT.last_error = msg
+                print(msg)
+                BOT.note("error", msg)
             return False
+        if _thread is not None and mine:
+            BOT.note("warn", "The bot thread had stopped, starting it again")
         BOT.stop = False
+        BOT.stop_reason = None
+        BOT.last_error = None
         _thread = threading.Thread(target=run_forever, args=(BOT,),
                                    daemon=True, name="deriv-bot")
+        _owner_pid = os.getpid()
         _thread.start()
+
+        url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+        if url and os.environ.get("KEEPALIVE", "1") != "0" and not (
+                _keepalive and _keepalive.is_alive()):
+            _keepalive = threading.Thread(target=_keepalive_loop, args=(url,),
+                                          daemon=True, name="keepalive")
+            _keepalive.start()
         return True
+
+def ensure_bot() -> None:
+    """Cheap check run on every web request: start the bot in THIS process if
+    it is not running (first request, crashed thread, or a forked gunicorn
+    worker). A bot stopped on purpose (stop-loss, take-profit) stays stopped."""
+    if BOT.stop or os.environ.get("DERIV_AUTOSTART", "1") != "1":
+        return
+    if _thread and _thread.is_alive() and _owner_pid == os.getpid():
+        return
+    start_background_bot()
+
+# gunicorn --preload (or any os.fork) would copy the bot into the worker while
+# the original keeps trading in the parent. Stop the parent's bot at fork time
+# and start a fresh one in the child, so exactly one bot trades.
+def _before_fork():
+    _lock.acquire()
+    BOT.lock.acquire()
+    if _thread and _thread.is_alive() and _owner_pid == os.getpid():
+        BOT.stop = True
+        BOT.stop_reason = "forked"
+
+def _after_fork_parent():
+    BOT.lock.release()
+    _lock.release()
+
+def _after_fork_child():
+    global _thread, _owner_pid, _lock, _keepalive
+    _lock = threading.Lock()
+    BOT.lock = threading.RLock()
+    if BOT.stop_reason == "forked":       # only undo the stop caused by the fork itself
+        BOT.stop = False
+        BOT.stop_reason = None
+    BOT.connected = False
+    BOT.pending = False
+    BOT.pending_trade = None
+    _thread = None
+    _owner_pid = None
+    _keepalive = None
+    t = threading.Timer(2.0, start_background_bot)
+    t.daemon = True
+    t.start()
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_before_fork,
+                        after_in_parent=_after_fork_parent,
+                        after_in_child=_after_fork_child)
 
 try:
     from flask import Flask, Response, jsonify, request
@@ -786,6 +894,10 @@ else:
             return True
         given = request.headers.get("X-Status-Key") or request.args.get("key") or ""
         return hmac.compare_digest(given.encode(), key.encode())
+
+    @app.before_request
+    def _keep_bot_alive():
+        ensure_bot()
 
     @app.after_request
     def security_headers(resp):

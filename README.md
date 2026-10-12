@@ -25,7 +25,8 @@ On Pydroid (Android), set the two values with `os.environ[...] = "..."` at the t
 - Set `STATUS_KEY` in Render to protect the dashboard. The page then asks for that key once and remembers it on that device. Without it, anyone with the link can see your balance and trades (the page warns you).
 - `/health` is a tiny public check for uptime monitors. `/api/state` is the data behind the dashboard (also at `/status`) and needs the key when `STATUS_KEY` is set.
 - Files needed in the repo: `under9.py`, `dashboard.html`, `requirements.txt`.
-- Render's free tier sleeps a service after ~15 minutes without web traffic, which stops the bot. Ping `/health` every 5 minutes from an uptime monitor, or use a paid instance.
+- Render's free tier sleeps a service after ~15 minutes without web traffic, which stops the bot. On Render the bot pings its own `/health` every 10 minutes to stay awake (set `KEEPALIVE=0` to turn that off). For extra safety, also ping `/health` every 5 minutes from an uptime monitor, or use a paid instance.
+- The bot starts in the web process itself and is restarted automatically if its thread is missing (for example after `--preload` forks a worker), so exactly one bot trades. A bot stopped by stop-loss, take-profit or the trade limit stays stopped until you restart the service.
 - A restart (deploy, crash, sleep) resets the session's profit/loss counters, so stop-loss and take-profit start fresh.
 
 ## Safety
