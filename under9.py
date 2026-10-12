@@ -28,6 +28,7 @@ Install:  pip install websocket-client
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import threading
@@ -140,31 +141,61 @@ def find_wss(obj):
                 return r
     return None
 
+# The account the bot is trading on (shown on the dashboard).
+ACCOUNT = {"id": None, "type": ACCOUNT_TYPE}
+
+def account_id_of(a: dict):
+    for key in ("account_id", "accountId", "id", "loginid"):
+        if a.get(key):
+            return str(a[key])
+    return None
+
+def account_kind(a: dict):
+    """Return "demo", "real" or None when it cannot be told.
+
+    Looks at explicit fields first, then at the account id prefix
+    (VRTC / DOT = demo, CR / ROT / MF / MLT / MX = real). It never searches
+    the whole record for the word "demo", because a real account can carry a
+    field such as "demo_account": false."""
+    virtual = a.get("is_virtual")
+    if virtual in (1, True, "1", "true"):
+        return "demo"
+    if virtual in (0, False, "0", "false"):
+        return "real"
+    for key in ("account_type", "accountType", "type"):
+        v = a.get(key)
+        if isinstance(v, str):
+            lv = v.strip().lower()
+            if lv in ("demo", "virtual"):
+                return "demo"
+            if lv in ("real", "live"):
+                return "real"
+    ident = (account_id_of(a) or "").upper()
+    if ident.startswith(("VR", "DOT", "DEMO")):
+        return "demo"
+    if ident.startswith(("CR", "ROT", "MF", "MLT", "MX")):
+        return "real"
+    return None
+
 def get_ws_url() -> str:
     data = rest("GET", "/trading/v1/options/accounts")
     accounts = [a for a in find_list(data) if isinstance(a, dict)]
     if not accounts:
         raise RuntimeError("No accounts found: " + json.dumps(data)[:300])
 
-    chosen = None
-    for a in accounts:
-        if ACCOUNT_TYPE in json.dumps(a).lower():
-            chosen = a
-            break
+    # Never fall back to a different account type (e.g. real instead of demo).
+    chosen = next((a for a in accounts if account_kind(a) == ACCOUNT_TYPE), None)
     if chosen is None:
-        # Never fall back to a different account type (e.g. real instead of demo).
-        raise ConfigError(f"No '{ACCOUNT_TYPE}' account found in: "
-                          + json.dumps(accounts)[:300])
+        found = ", ".join(f"{account_id_of(a) or '?'}={account_kind(a) or 'unknown'}"
+                          for a in accounts)
+        raise ConfigError(f"No '{ACCOUNT_TYPE}' account found (accounts: {found})")
 
-    account_id = None
-    for key in ("account_id", "accountId", "id", "loginid"):
-        if chosen.get(key):
-            account_id = chosen[key]
-            break
+    account_id = account_id_of(chosen)
     if not account_id:
         raise RuntimeError("Could not find account id: " + json.dumps(chosen)[:300])
 
-    print("Using account:", account_id)
+    ACCOUNT.update(id=account_id, type=ACCOUNT_TYPE)
+    print("Using account:", account_id, f"({ACCOUNT_TYPE})")
     otp = rest("POST", f"/trading/v1/options/accounts/{account_id}/otp")
     url = find_wss(otp)
     if not url:
@@ -196,6 +227,98 @@ class Bot:
         self.decimals        = {}              # symbol -> quote precision
         self.connected       = False
         self.last_error      = None
+        # ---- dashboard data ----
+        self.lock            = threading.RLock()     # bot thread vs web thread
+        self.events          = deque(maxlen=100)     # newest first
+        self.trade_log       = deque(maxlen=500)     # oldest first
+        self.balance_history = deque(maxlen=300)     # [timestamp, balance]
+        self.last_price      = {}                    # symbol -> latest quote
+        self.pending_trade   = None                  # trade waiting for its buy confirmation
+        self.stop_reason     = None
+
+    # ---------- dashboard helpers ----------
+    def note(self, level: str, msg: str):
+        """Add a line to the event list shown on the dashboard."""
+        with self.lock:
+            self.events.appendleft({"level": level, "t": round(time.time(), 1),
+                                    "msg": str(msg)[:300]})
+
+    def request_stop(self, reason: str, msg: str | None = None, level: str = "info"):
+        """Stop the bot. The first reason wins."""
+        with self.lock:
+            if self.stop:
+                return
+            self.stop = True
+            self.stop_reason = reason
+            if msg:
+                print(msg)
+                self.note(level, msg)
+
+    def snapshot(self, running: bool, protected: bool) -> dict:
+        """Everything the dashboard shows, as plain JSON-safe data."""
+        with self.lock:
+            over   = self.mode == "over"
+            closed = [r for r in self.trade_log if r["status"] != "open"]
+            wins   = sum(1 for r in closed if r["status"] == "won")
+            losses = len(closed) - wins
+            net    = sum(r["profit"] or 0.0 for r in closed)
+            session_pl = (round(self.balance - self.start_balance, 2)
+                          if self.balance is not None and self.start_balance is not None
+                          else None)
+
+            scanner = []
+            for sym in CANDIDATE_SYMBOLS:
+                hist = list(self.digit_history.get(sym, ()))
+                f01  = self.digit_freq(sym, (0, 1))
+                f89  = self.digit_freq(sym, (8, 9))
+                scanner.append({
+                    "symbol": sym,
+                    "digits": hist[-30:],
+                    "ticks": len(hist),
+                    "price": self.last_price.get(sym),
+                    "decimals": self.decimals.get(sym),
+                    "f01": f01, "f89": f89,
+                    "collecting": f01 is None,
+                    "ready": self.is_eligible(sym),
+                })
+
+            trades = [{
+                "n": r["n"], "symbol": r["symbol"], "contract_type": r["contract_type"],
+                "barrier": r["barrier"], "stake": r["stake"], "status": r["status"],
+                "profit": None if r["profit"] is None else round(r["profit"], 2),
+                "t_open": r["t_open"],
+            } for r in reversed(self.trade_log)][:100]
+
+            return {
+                "bot_running": running,
+                "connected": self.connected,
+                "stopped": self.stop,
+                "stop_reason": self.stop_reason,
+                "last_error": self.last_error,
+                "protected": protected,
+                "trading_enabled": TRADING_ENABLED,
+                "account": dict(ACCOUNT),
+                "currency": self.currency,
+                "balance": self.balance,
+                "session_pl": session_pl,
+                "balance_history": list(self.balance_history)[-120:],
+                "limits": {"max_trades": MAX_TRADES, "stop_loss": STOP_LOSS,
+                           "take_profit": TAKE_PROFIT, "stake": STAKE},
+                "stats": {"trades": self.trades, "wins": wins, "losses": losses,
+                          "win_rate": (wins / len(closed)) if closed else None,
+                          "net": round(net, 2)},
+                "trades": trades,
+                "mode": self.mode,
+                "barriers": list(self.barriers()),
+                "barrier_idx": self.barrier_idx,
+                "barrier": self.current_barrier(),
+                "no_match_streak": self.no_match_streak,
+                "no_match_limit": NO_MATCH_LIMIT,
+                "filter": {"max_freq": MAX_01_FREQUENCY if over else MAX_89_FREQUENCY,
+                           "window": DIGIT_WINDOW, "min_ticks": MIN_TICKS_FOR_FILTER},
+                "scanner": scanner,
+                "events": list(self.events),
+            }
 
     def tick_digit(self, symbol: str, tick: dict, price: float) -> int:
         """Last digit of the quote *including* trailing zeros (1234.50 -> 0).
@@ -229,6 +352,7 @@ class Bot:
         print(f"\n*** SWITCHED STRATEGY: {old.upper()} → {self.mode.upper()} ***")
         print(f"    New barriers: {self.barriers()}")
         print(f"    Contract    : {self.contract_type()}\n")
+        self.note("info", f"Switched strategy from {old.title()} to {self.mode.title()}")
 
     def on_win(self):
         first = self.barriers()[0]
@@ -267,13 +391,13 @@ class Bot:
         return any(self.is_eligible(s) for s in CANDIDATE_SYMBOLS)
 
     def can_trade(self, symbol: str) -> bool:
-        if self.pending or self.open_contract:
+        if self.stop or self.pending or self.open_contract:
             return False
         if time.time() - self.last_trade_ts < COOLDOWN_SECONDS:
             return False
         if self.trades >= MAX_TRADES:
-            print("Max trades reached – stopping.")
-            self.stop = True
+            self.request_stop("max_trades",
+                              f"Trade limit of {MAX_TRADES} reached – stopping.")
             return False
         return self.is_eligible(symbol)
 
@@ -299,6 +423,8 @@ class Bot:
             return
 
         self.pending = True
+        self.pending_trade = {"symbol": symbol, "contract_type": ctype,
+                              "barrier": int(barrier), "mode": self.mode}
         ws.send(json.dumps({
             "proposal": 1,
             "amount": STAKE,
@@ -329,10 +455,17 @@ class Bot:
             self.switch_mode()
 
     def handle(self, ws, msg: dict):
+        with self.lock:
+            self._handle(ws, msg)
+
+    def _handle(self, ws, msg: dict):
         if "error" in msg:
             err = msg["error"]
-            print("API error:", err.get("message") or err)
+            text = (err.get("message") if isinstance(err, dict) else None) or str(err)
+            print("API error:", text)
+            self.note("error", "Deriv rejected a request: " + text)
             self.pending = False
+            self.pending_trade = None
             return
 
         t = msg.get("msg_type")
@@ -350,6 +483,7 @@ class Bot:
 
             digit = self.tick_digit(symbol, tick, price)
             self.digit_history[symbol].append(digit)
+            self.last_price[symbol] = price
             self.ticks_seen += 1
 
             # periodic mode-switch check
@@ -397,13 +531,18 @@ class Bot:
             profit = self.balance - self.start_balance
             print(f"BALANCE: {self.balance:.2f} {self.currency}  (P/L {profit:+.2f})")
 
+            if (not self.balance_history
+                    or self.balance_history[-1][1] != self.balance):
+                self.balance_history.append([round(time.time(), 1), self.balance])
+
             if TRADING_ENABLED:
                 if profit <= -STOP_LOSS:
-                    print(f"Stop-loss ${STOP_LOSS} hit – stopping.")
-                    self.stop = True
+                    self.request_stop("stop_loss",
+                                      f"Stop-loss ${STOP_LOSS:.2f} reached – stopping.",
+                                      "warn")
                 elif profit >= TAKE_PROFIT:
-                    print(f"Take-profit ${TAKE_PROFIT} hit – stopping.")
-                    self.stop = True
+                    self.request_stop("take_profit",
+                                      f"Take-profit ${TAKE_PROFIT:.2f} reached – stopping.")
 
         # ---- proposal → buy ----
         elif t == "proposal":
@@ -411,7 +550,9 @@ class Bot:
             prop_id = prop.get("id")
             if not prop_id:
                 print("Proposal missing id:", json.dumps(msg)[:250])
+                self.note("error", "Deriv sent a proposal without an id, trade skipped")
                 self.pending = False
+                self.pending_trade = None
                 return
             print(f"  Proposal OK – buying id={prop_id}")
             ws.send(json.dumps({
@@ -430,6 +571,24 @@ class Bot:
             print(f"Trade #{self.trades} placed  ({self.mode.upper()})  "
                   f"contract_id={contract_id}  barrier={self.current_barrier()}")
 
+            pt = self.pending_trade or {}
+            self.pending_trade = None
+            try:
+                stake = float(buy.get("buy_price") or STAKE)
+            except (TypeError, ValueError):
+                stake = STAKE
+            rec = {
+                "n": self.trades, "contract_id": contract_id,
+                "symbol": pt.get("symbol", "?"),
+                "contract_type": pt.get("contract_type", self.contract_type()),
+                "barrier": pt.get("barrier", self.current_barrier()),
+                "stake": stake, "status": "open", "profit": None,
+                "t_open": time.time(), "t_close": None,
+            }
+            self.trade_log.append(rec)
+            kind = "Over" if rec["contract_type"] == "DIGITOVER" else "Under"
+            self.note("info", f"Trade #{rec['n']} placed: {rec['symbol']} {kind} {rec['barrier']}")
+
             if contract_id:
                 ws.send(json.dumps({
                     "proposal_open_contract": 1,
@@ -443,9 +602,22 @@ class Bot:
             if not (poc.get("is_sold") or poc.get("status") == "sold"):
                 return
 
-            profit = float(poc.get("profit", 0) or 0)
+            try:
+                profit = float(poc.get("profit", 0) or 0)
+            except (TypeError, ValueError):
+                profit = 0.0
             cid = poc.get("contract_id")
+            rec = next((r for r in reversed(self.trade_log)
+                        if r["contract_id"] == cid), None)
+            if rec is not None and rec["status"] != "open":
+                return          # repeat update for a trade already settled
             print(f"Contract {cid} closed  profit={profit:+.2f}")
+
+            if rec is not None:
+                rec["status"]  = "won" if profit > 0 else "lost"
+                rec["profit"]  = profit
+                rec["t_close"] = time.time()
+                self.note("info", f"Trade #{rec['n']} {rec['status']}: {profit:+.2f}")
 
             if profit > 0:
                 self.on_win()
@@ -467,8 +639,19 @@ def run_session(bot: Bot):
     ws.settimeout(10)
     print("Connected.")
     bot.connected = True
+    bot.note("info", f"Connected to Deriv ({ACCOUNT['type']} account {ACCOUNT['id']})")
+    with bot.lock:
+        bot.pending = False            # an unanswered proposal died with the old connection
+        bot.pending_trade = None
+        stuck = bot.open_contract
 
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+    if stuck:
+        # A trade was open when the connection dropped: ask for its result,
+        # otherwise the bot would wait for it forever and never trade again.
+        bot.note("warn", "Reconnected while a trade was open, checking its result")
+        ws.send(json.dumps({"proposal_open_contract": 1,
+                            "contract_id": stuck, "subscribe": 1}))
 
     for sym in CANDIDATE_SYMBOLS:
         ws.send(json.dumps({"ticks": sym, "subscribe": 1}))
@@ -487,9 +670,15 @@ def run_session(bot: Bot):
     last_ping    = time.time()
     last_balance = time.time()
 
+    stop_seen = None
     try:
-        while not bot.stop:
+        while True:
             now = time.time()
+            if bot.stop:
+                # Let an open trade finish so its result is recorded.
+                stop_seen = stop_seen or now
+                if not bot.open_contract or now - stop_seen > 20:
+                    break
             if now - last_ping > 25:
                 ws.send(json.dumps({"ping": 1}))
                 last_ping = now
@@ -519,20 +708,22 @@ def run_forever(bot: Bot):
             run_session(bot)
             delay = 3
         except KeyboardInterrupt:
-            print("\nStopped by user.")
-            bot.stop = True
+            bot.request_stop("user", "Stopped by user.")
             return
         except ConfigError as e:
             bot.last_error = f"Login problem: {e}"
             print(bot.last_error)
-            bot.stop = True
+            bot.note("error", bot.last_error)
+            bot.request_stop("login")
             return
         except (WebSocketConnectionClosedException, ConnectionError, OSError) as e:
             bot.last_error = f"Connection lost: {e}"
             print(bot.last_error)
+            bot.note("warn", bot.last_error)
         except Exception as e:
             bot.last_error = f"Error: {e}"
             print(bot.last_error)
+            bot.note("error", bot.last_error)
 
         if bot.stop:
             break
@@ -551,9 +742,14 @@ def main():
 # ================= Web wrapper (Render / gunicorn) =================
 # Start command:  gunicorn under9:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
 # Keep --workers 1: each worker would run its own copy of the bot.
-# Endpoints:  /health  (public, for uptime pings)
-#             /status  (bot details; protected by ?key=$STATUS_KEY when set)
+# Endpoints:  /           dashboard page (dashboard.html)
+#             /health     tiny public check, for uptime pings
+#             /api/state  everything the dashboard shows (also at /status);
+#                         when STATUS_KEY is set it needs that key, sent as the
+#                         X-Status-Key header or ?key=
 # Running `python3 under9.py` directly does not need Flask.
+DASHBOARD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "dashboard.html")
 BOT     = Bot()
 _thread = None
 _lock   = threading.Lock()
@@ -567,8 +763,9 @@ def start_background_bot() -> bool:
         if _thread and _thread.is_alive():
             return False
         if not APP_ID or not TOKEN:
-            BOT.last_error = "DERIV_APP_ID / DERIV_TOKEN not set"
+            BOT.last_error = "Missing DERIV_APP_ID or DERIV_TOKEN"
             print(BOT.last_error)
+            BOT.note("error", BOT.last_error)
             return False
         BOT.stop = False
         _thread = threading.Thread(target=run_forever, args=(BOT,),
@@ -577,39 +774,50 @@ def start_background_bot() -> bool:
         return True
 
 try:
-    from flask import Flask, jsonify, request
+    from flask import Flask, Response, jsonify, request
 except ImportError:      # plain local run without Flask
     app = None
 else:
     app = Flask(__name__)
 
+    def key_ok() -> bool:
+        key = os.environ.get("STATUS_KEY", "")
+        if not key:
+            return True
+        given = request.headers.get("X-Status-Key") or request.args.get("key") or ""
+        return hmac.compare_digest(given.encode(), key.encode())
+
+    @app.after_request
+    def security_headers(resp):
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Referrer-Policy"] = "no-referrer"
+        return resp
+
     @app.route("/")
+    def index():
+        try:
+            with open(DASHBOARD_FILE, encoding="utf-8") as f:
+                html = f.read()
+        except OSError:
+            return jsonify(ok=True, bot_running=bot_running(),
+                           note="dashboard.html is missing from the repository")
+        resp = Response(html, mimetype="text/html")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
     @app.route("/health")
     def health():
         return jsonify(ok=True, bot_running=bot_running())
 
+    @app.route("/api/state")
     @app.route("/status")
-    def status():
-        key = os.environ.get("STATUS_KEY")
-        if key and request.args.get("key") != key:
+    def api_state():
+        if not key_ok():
             return jsonify(error="forbidden"), 403
-        profit = (BOT.balance - BOT.start_balance
-                  if BOT.balance is not None and BOT.start_balance is not None
-                  else None)
-        return jsonify(
-            bot_running=bot_running(),
-            connected=BOT.connected,
-            account_type=ACCOUNT_TYPE,
-            trading_enabled=TRADING_ENABLED,
-            mode=BOT.mode,
-            barrier=BOT.current_barrier(),
-            trades=BOT.trades,
-            balance=BOT.balance,
-            profit=profit,
-            stopped=BOT.stop,
-            ticks_seen=BOT.ticks_seen,
-            last_error=BOT.last_error,
-        )
+        resp = jsonify(BOT.snapshot(bot_running(), bool(os.environ.get("STATUS_KEY"))))
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     # Under gunicorn the module is imported, not run as a script.
     if __name__ != "__main__" and os.environ.get("DERIV_AUTOSTART", "1") == "1":

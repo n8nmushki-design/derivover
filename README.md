@@ -21,7 +21,10 @@ On Pydroid (Android), set the two values with `os.environ[...] = "..."` at the t
   (keep `--workers 1`, otherwise several copies of the bot would trade at once)
 - Environment variables: `DERIV_APP_ID`, `DERIV_TOKEN`, and optionally `STATUS_KEY`
 - The bot starts by itself in a background thread when the service starts.
-- `/health` is public. `/status` shows mode, trades, balance and last error; if `STATUS_KEY` is set, open `/status?key=<STATUS_KEY>`.
+- Open your Render URL to see the dashboard: real or demo account, balance, session profit or loss, every trade, the digit scanner, the strategy ladder and a list of events and errors. It works on desktop and phone.
+- Set `STATUS_KEY` in Render to protect the dashboard. The page then asks for that key once and remembers it on that device. Without it, anyone with the link can see your balance and trades (the page warns you).
+- `/health` is a tiny public check for uptime monitors. `/api/state` is the data behind the dashboard (also at `/status`) and needs the key when `STATUS_KEY` is set.
+- Files needed in the repo: `under9.py`, `dashboard.html`, `requirements.txt`.
 - Render's free tier sleeps a service after ~15 minutes without web traffic, which stops the bot. Ping `/health` every 5 minutes from an uptime monitor, or use a paid instance.
 - A restart (deploy, crash, sleep) resets the session's profit/loss counters, so stop-loss and take-profit start fresh.
 
