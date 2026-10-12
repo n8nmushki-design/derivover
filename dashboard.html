@@ -219,6 +219,8 @@ tr.fresh td { animation: flash 2.4s ease-out; }
 .chip.cur { background: var(--ink); color: var(--bg); }
 .strategy-note { color: var(--muted); font-size: 14px; }
 .strategy-note + .strategy-note { margin-top: 6px; }
+.strat { padding-bottom: 16px; margin-bottom: 16px; border-bottom: 1px solid var(--rule); }
+.strat-name { color: var(--muted); font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
 
 /* ---------- events ---------- */
 .tabs { display: flex; gap: 6px; }
@@ -452,20 +454,25 @@ function renderStats() {
 /* ----- markets / digit tape ----- */
 function renderMarkets() {
   var narrow = window.matchMedia("(max-width: 600px)").matches, n = narrow ? 20 : 30;
-  var over = S.mode === "over";
-  $("marketSub").textContent = "The " + (over ? "Over" : "Under") + " strategy trades a market when digits " + (over ? "0 and 1" : "8 and 9") +
-    " are under " + Math.round(S.filter.max_freq * 100) + "% of its last " + S.filter.window + " ticks.";
+  var sub = S.strategies.map(function (s) {
+    return s.label + " trades a market when digits " + s.digits[0] + " and " + s.digits[1] + " are under " + Math.round(s.max_freq * 100) +
+      "% of its last " + S.filter.window + " ticks.";
+  }).join(" ");
+  $("marketSub").textContent = "Both strategies scan every market at the same time. " + sub;
   $("mrows").innerHTML = S.scanner.map(function (m) {
     var cells = m.digits.slice(-n).map(function (d, i, a) {
       var c = d <= 1 ? "low" : d >= 8 ? "high" : "mid";
       return '<span class="d ' + c + (i === a.length - 1 ? " now" : "") + '">' + d + "</span>";
     }).join("");
     var status = m.collecting ? '<span class="muted">Collecting ' + m.ticks + "/" + S.filter.min_ticks + "</span>"
-      : m.ready ? '<span class="ready">Ready</span>' : '<span class="muted">Skipping</span>';
+      : m.ready_over && m.ready_under ? '<span class="ready">Over and Under ready</span>'
+      : m.ready_over ? '<span class="ready">Over ready</span>'
+      : m.ready_under ? '<span class="ready">Under ready</span>'
+      : '<span class="muted">Skipping</span>';
     var price = m.price == null ? "" : '<span class="price">' + (m.decimals != null ? m.price.toFixed(m.decimals) : m.price) + "</span>";
     return '<div class="mrow"><div class="sym">' + esc(m.symbol) + price + '</div><div class="digits">' + cells + "</div>" +
-      '<div class="f f1' + (over ? " active" : "") + '"><span class="lab">Digits 0–1: </span>' + pct(m.f01) + "</div>" +
-      '<div class="f f2' + (over ? "" : " active") + '"><span class="lab">Digits 8–9: </span>' + pct(m.f89) + "</div>" +
+      '<div class="f f1' + (m.ready_over ? " active" : "") + '"><span class="lab">Digits 0–1: </span>' + pct(m.f01) + "</div>" +
+      '<div class="f f2' + (m.ready_under ? " active" : "") + '"><span class="lab">Digits 8–9: </span>' + pct(m.f89) + "</div>" +
       '<div class="stat-c">' + status + "</div></div>";
   }).join("");
 }
@@ -499,14 +506,15 @@ function renderTrades() {
 
 /* ----- strategy ----- */
 function renderStrategy() {
-  var over = S.mode === "over", cur = S.barrier_idx, b = S.barriers;
-  var chips = b.map(function (v, i) { return '<span class="chip' + (i === cur ? " cur" : i < cur ? " past" : "") + '">' + v + "</span>"; }).join("");
-  var next = cur < b.length - 1 ? "After a loss the barrier moves to " + b[cur + 1] + "." : "After a loss the barrier goes back to " + b[0] + ".";
-  var other = over ? "Under" : "Over";
-  $("strategyBody").innerHTML = '<div class="contract">' + (over ? "Over " : "Under ") + S.barrier + '</div>' +
-    '<div class="ladder" aria-label="Barrier ladder">' + chips + "</div>" +
-    '<p class="strategy-note">' + esc(next) + " A win goes back to " + b[0] + ".</p>" +
-    '<p class="strategy-note">No market passed the filter ' + S.no_match_streak + " of " + S.no_match_limit + " times. At " + S.no_match_limit + " the bot switches to " + other + ".</p>";
+  $("strategyBody").innerHTML = S.strategies.map(function (s) {
+    var cur = s.barrier_idx, b = s.barriers;
+    var chips = b.map(function (v, i) { return '<span class="chip' + (i === cur ? " cur" : i < cur ? " past" : "") + '">' + v + "</span>"; }).join("");
+    var next = cur < b.length - 1 ? "After a loss the barrier moves to " + b[cur + 1] + "." : "After a loss the barrier goes back to " + b[0] + ".";
+    return '<div class="strat"><div class="strat-name">' + esc(s.label) + ' strategy</div>' +
+      '<div class="contract">' + esc(s.kind) + " " + s.barrier + '</div>' +
+      '<div class="ladder" aria-label="' + esc(s.label) + ' barrier ladder">' + chips + "</div>" +
+      '<p class="strategy-note">' + esc(next) + " A win goes back to " + b[0] + ".</p></div>";
+  }).join("") + '<p class="strategy-note">Both strategies run at the same time. Each keeps its own barrier ladder, and one trade is open at a time.</p>';
 }
 
 /* ----- events ----- */

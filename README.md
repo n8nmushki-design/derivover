@@ -1,7 +1,7 @@
 # derivover
 
 Deriv Digit Over/Under bot (new Deriv API: App ID + `pat_` token + OTP).
-Starts with **Over 0**, switches to **Under 9** after 5 consecutive scans with no eligible market. See the docstring in `under9.py` for the full strategy.
+Scans **Over 0** and **Under 9** at the same time: every tick of every market is checked against both filters, and the first market that passes either one is traded (one trade open at a time). Each strategy keeps its own barrier ladder. See the docstring in `under9.py` for the full strategy.
 
 ## Run
 

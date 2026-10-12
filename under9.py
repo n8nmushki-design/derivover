@@ -2,26 +2,32 @@
 """
 Deriv Digit Over / Under bot – New Deriv API (App ID + pat_ token + OTP)
 
-Two strategies
---------------
-1. OVER  (default) – “Over 0 strategy”
+Two strategies, scanned at the same time
+-----------------------------------------
+Every tick of every market is checked against BOTH strategies. The first
+market that passes either filter is traded (if both pass on the same market,
+the one with the lower frequency wins). One trade is open at a time.
+
+1. OVER  – “Over 0 strategy”
    • DIGITOVER
    • Barriers on loss : 0 → 5 → 5 → 6 → 6 → 7 → 7 → 8 → 8
    • Filter           : recent frequency of digits 0 and 1 < 10 %
-   • On WIN           : reset barrier to 0 and continue
+   • On WIN           : reset this strategy's barrier to 0
 
-2. UNDER (activated after 5 consecutive “no-match” scans)
+2. UNDER – “Under 9 strategy”
    • DIGITUNDER
    • Barriers on loss : 9 → 5 → 5 → 4 → 4 → 3 → 3 → 2 → 2 → 1 → 1
    • Filter           : recent frequency of digits 8 and 9 < 10 %
-   • On WIN           : reset barrier to 9 and continue
+   • On WIN           : reset this strategy's barrier to 9
+
+Each strategy keeps its own barrier ladder; a result only moves the ladder of
+the strategy that placed the trade.
 
 Common settings
 ---------------
 • Stake $1, duration 1 tick
 • Stop-loss $3, take-profit $7.50
 • Scans all listed volatility indices
-• Switches back and forth after 5 failed scans each
 
 Install:  pip install websocket-client
 """
@@ -63,10 +69,7 @@ TAKE_PROFIT       = 7.5
 OVER_BARRIERS  = [0, 5, 5, 6, 6, 7, 7, 8, 8]
 UNDER_BARRIERS = [9, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1]
 
-# How many consecutive “no eligible market” checks before switching strategy
-NO_MATCH_LIMIT   = 5
-MODE_CHECK_SECS  = 8            # check eligibility every N seconds
-PENDING_TIMEOUT  = 20           # give up on a trade request Deriv never answered (seconds)
+PENDING_TIMEOUT = 20           # give up on a trade request Deriv never answered (seconds)
 OPEN_CHECK_SECS  = 30           # re-check a contract that has not settled after this long
 
 CANDIDATE_SYMBOLS = [
@@ -80,6 +83,14 @@ MAX_01_FREQUENCY     = 0.10
 # Under filter: frequency of digits 8 and 9 combined
 MAX_89_FREQUENCY     = 0.10
 MIN_TICKS_FOR_FILTER = 50
+
+# Both strategies are active at once.
+STRATEGIES = {
+    "over":  {"label": "Over 0",  "kind": "Over",  "contract": "DIGITOVER",
+              "barriers": OVER_BARRIERS,  "digits": (0, 1), "max_freq": MAX_01_FREQUENCY},
+    "under": {"label": "Under 9", "kind": "Under", "contract": "DIGITUNDER",
+              "barriers": UNDER_BARRIERS, "digits": (8, 9), "max_freq": MAX_89_FREQUENCY},
+}
 # ======================================================
 
 def clean(s: str) -> str:
@@ -211,8 +222,8 @@ def decimals_needed(price) -> int:
 
 class Bot:
     def __init__(self):
-        self.mode            = "over"          # "over" or "under"
-        self.barrier_idx     = 0
+        self.idx             = {"over": 0, "under": 0}   # barrier ladder position per strategy
+        self.open_strategy   = None            # strategy that placed the open trade
         self.trades          = 0
         self.pending         = False
         self.last_trade_ts   = 0.0
@@ -224,9 +235,7 @@ class Bot:
         self.digit_history   = defaultdict(lambda: deque(maxlen=DIGIT_WINDOW))
         self.ticks_seen      = 0
         self.last_status     = {}
-        self.no_match_streak = 0
-        self.last_mode_check = 0.0
-        self.decimals        = {}              # symbol -> quote precision
+        self.decimals       = {}              # symbol -> quote precision
         self.connected       = False
         self.last_error      = None
         # ---- dashboard data ----
@@ -261,7 +270,6 @@ class Bot:
     def snapshot(self, running: bool, protected: bool) -> dict:
         """Everything the dashboard shows, as plain JSON-safe data."""
         with self.lock:
-            over   = self.mode == "over"
             closed = [r for r in self.trade_log if r["status"] != "open"]
             wins   = sum(1 for r in closed if r["status"] == "won")
             losses = len(closed) - wins
@@ -283,8 +291,16 @@ class Bot:
                     "decimals": self.decimals.get(sym),
                     "f01": f01, "f89": f89,
                     "collecting": f01 is None,
-                    "ready": self.is_eligible(sym),
+                    "ready_over": self.is_eligible(sym, "over"),
+                    "ready_under": self.is_eligible(sym, "under"),
                 })
+
+            strategies = [{
+                "key": key, "label": s["label"], "kind": s["kind"],
+                "contract_type": s["contract"], "barriers": list(s["barriers"]),
+                "barrier_idx": self.idx[key], "barrier": self.current_barrier(key),
+                "digits": list(s["digits"]), "max_freq": s["max_freq"],
+            } for key, s in STRATEGIES.items()]
 
             trades = [{
                 "n": r["n"], "symbol": r["symbol"], "contract_type": r["contract_type"],
@@ -312,14 +328,8 @@ class Bot:
                           "win_rate": (wins / len(closed)) if closed else None,
                           "net": round(net, 2)},
                 "trades": trades,
-                "mode": self.mode,
-                "barriers": list(self.barriers()),
-                "barrier_idx": self.barrier_idx,
-                "barrier": self.current_barrier(),
-                "no_match_streak": self.no_match_streak,
-                "no_match_limit": NO_MATCH_LIMIT,
-                "filter": {"max_freq": MAX_01_FREQUENCY if over else MAX_89_FREQUENCY,
-                           "window": DIGIT_WINDOW, "min_ticks": MIN_TICKS_FOR_FILTER},
+                "strategies": strategies,
+                "filter": {"window": DIGIT_WINDOW, "min_ticks": MIN_TICKS_FOR_FILTER},
                 "scanner": scanner,
                 "events": list(self.events),
             }
@@ -338,39 +348,27 @@ class Bot:
         self.decimals[symbol] = dec
         return int(f"{price:.{dec}f}"[-1])
 
-    # ---------- mode helpers ----------
-    def barriers(self):
-        return OVER_BARRIERS if self.mode == "over" else UNDER_BARRIERS
+    # ---------- strategy helpers ----------
+    def barriers(self, key: str):
+        return STRATEGIES[key]["barriers"]
 
-    def current_barrier(self) -> int:
-        return self.barriers()[self.barrier_idx]
+    def current_barrier(self, key: str) -> int:
+        return self.barriers(key)[self.idx[key]]
 
-    def contract_type(self) -> str:
-        return "DIGITOVER" if self.mode == "over" else "DIGITUNDER"
+    def on_win(self, key: str):
+        s = STRATEGIES[key]
+        print(f"  → WIN ({s['label']}) – barrier reset to {s['barriers'][0]}")
+        self.idx[key] = 0
 
-    def switch_mode(self):
-        old = self.mode
-        self.mode = "under" if self.mode == "over" else "over"
-        self.barrier_idx = 0
-        self.no_match_streak = 0
-        print(f"\n*** SWITCHED STRATEGY: {old.upper()} → {self.mode.upper()} ***")
-        print(f"    New barriers: {self.barriers()}")
-        print(f"    Contract    : {self.contract_type()}\n")
-        self.note("info", f"Switched strategy from {old.title()} to {self.mode.title()}")
-
-    def on_win(self):
-        first = self.barriers()[0]
-        print(f"  → WIN – prediction reset to {first}  (continue)")
-        self.barrier_idx = 0
-
-    def on_loss(self):
-        blist = self.barriers()
-        if self.barrier_idx < len(blist) - 1:
-            self.barrier_idx += 1
-            print(f"  → LOSS – next prediction = {self.current_barrier()}")
+    def on_loss(self, key: str):
+        blist = self.barriers(key)
+        label = STRATEGIES[key]["label"]
+        if self.idx[key] < len(blist) - 1:
+            self.idx[key] += 1
+            print(f"  → LOSS ({label}) – next barrier = {self.current_barrier(key)}")
         else:
-            print(f"  → LOSS – end of list, reset to {blist[0]}")
-            self.barrier_idx = 0
+            print(f"  → LOSS ({label}) – end of list, reset to {blist[0]}")
+            self.idx[key] = 0
 
     # ---------- frequency filters ----------
     def digit_freq(self, symbol: str, digits) -> float | None:
@@ -381,46 +379,52 @@ class Bot:
         count = sum(1 for d in hist if d in digits)
         return count / len(hist)
 
-    def is_eligible(self, symbol: str) -> bool:
-        if self.mode == "over":
-            # Over 0 strategy: frequency of 0 and 1 combined must be < 10 %
-            freq = self.digit_freq(symbol, (0, 1))
-            return freq is not None and freq < MAX_01_FREQUENCY
-        else:
-            # Under 9 strategy: frequency of 8 and 9 combined must be < 10 %
-            freq = self.digit_freq(symbol, (8, 9))
-            return freq is not None and freq < MAX_89_FREQUENCY
+    def strategy_freq(self, symbol: str, key: str) -> float | None:
+        return self.digit_freq(symbol, STRATEGIES[key]["digits"])
 
-    def any_eligible(self) -> bool:
-        return any(self.is_eligible(s) for s in CANDIDATE_SYMBOLS)
+    def is_eligible(self, symbol: str, key: str) -> bool:
+        """Over: digits 0 and 1 combined < 10 %.  Under: digits 8 and 9 combined < 10 %."""
+        freq = self.strategy_freq(symbol, key)
+        return freq is not None and freq < STRATEGIES[key]["max_freq"]
 
-    def can_trade(self, symbol: str) -> bool:
+    def pick_strategy(self, symbol: str) -> str | None:
+        """Both strategies are checked at once. If both pass on this market,
+        take the one furthest below its limit."""
+        best, best_score = None, None
+        for key, s in STRATEGIES.items():
+            freq = self.strategy_freq(symbol, key)
+            if freq is None or freq >= s["max_freq"]:
+                continue
+            score = freq / s["max_freq"]
+            if best_score is None or score < best_score:
+                best, best_score = key, score
+        return best
+
+    def can_trade(self, symbol: str) -> str | None:
+        """Return the strategy to trade on this market now, or None."""
         if self.stop or self.pending or self.open_contract:
-            return False
+            return None
         if time.time() - self.last_trade_ts < COOLDOWN_SECONDS:
-            return False
+            return None
         if self.trades >= MAX_TRADES:
             self.request_stop("max_trades",
                               f"Trade limit of {MAX_TRADES} reached – stopping.")
-            return False
-        return self.is_eligible(symbol)
+            return None
+        return self.pick_strategy(symbol)
 
     def try_trade(self, ws, symbol: str, price: float):
-        if not self.can_trade(symbol):
+        key = self.can_trade(symbol)
+        if key is None:
             return
 
-        barrier = str(self.current_barrier())
-        ctype   = self.contract_type()
-
-        if self.mode == "over":
-            freq = self.digit_freq(symbol, (0, 1))
-            label = f"P(0 and 1)={freq*100:.1f}%"
-        else:
-            freq = self.digit_freq(symbol, (8, 9))
-            label = f"P(8 and 9)={freq*100:.1f}%"
+        s       = STRATEGIES[key]
+        barrier = str(self.current_barrier(key))
+        ctype   = s["contract"]
+        freq    = self.strategy_freq(symbol, key)
+        label   = f"P({s['digits'][0]} and {s['digits'][1]})={freq*100:.1f}%"
 
         print(f"\n★ ELIGIBLE {symbol}  {label}  "
-              f"→ {ctype} barrier={barrier} @ {price}")
+              f"→ {s['label']}: {ctype} barrier={barrier} @ {price}")
 
         if not TRADING_ENABLED:
             print("  [signals only] TRADING_ENABLED=False")
@@ -429,7 +433,7 @@ class Bot:
         self.pending = True
         self.pending_since = time.time()
         self.pending_trade = {"symbol": symbol, "contract_type": ctype,
-                              "barrier": int(barrier), "mode": self.mode}
+                              "barrier": int(barrier), "strategy": key}
         ws.send(json.dumps({
             "proposal": 1,
             "amount": STAKE,
@@ -441,30 +445,6 @@ class Bot:
             "underlying_symbol": symbol,
             "barrier": barrier,
         }))
-
-    def maybe_switch_mode(self):
-        """Called periodically. After NO_MATCH_LIMIT consecutive failures → switch."""
-        now = time.time()
-        if now - self.last_mode_check < MODE_CHECK_SECS:
-            return
-        self.last_mode_check = now
-
-        if self.any_eligible():
-            self.no_match_streak = 0
-            return
-
-        # Still collecting the first ticks everywhere: that is not a failed
-        # scan, so do not count it (otherwise a cold start switches to Under
-        # before Over has had any data to judge).
-        if not any(len(self.digit_history[s]) >= MIN_TICKS_FOR_FILTER
-                   for s in CANDIDATE_SYMBOLS):
-            return
-
-        self.no_match_streak += 1
-        print(f"  No eligible market for {self.mode.upper()} "
-              f"(streak {self.no_match_streak}/{NO_MATCH_LIMIT})")
-        if self.no_match_streak >= NO_MATCH_LIMIT:
-            self.switch_mode()
 
     def handle(self, ws, msg: dict):
         with self.lock:
@@ -512,27 +492,24 @@ class Bot:
             self.last_price[symbol] = price
             self.ticks_seen += 1
 
-            # periodic mode-switch check
-            self.maybe_switch_mode()
+            # status logging: both strategies are scanned on every tick
+            f01 = self.digit_freq(symbol, (0, 1))
+            f89 = self.digit_freq(symbol, (8, 9))
+            over_ok  = self.is_eligible(symbol, "over")
+            under_ok = self.is_eligible(symbol, "under")
 
-            # status logging
-            eligible = self.is_eligible(symbol)
-            if self.mode == "over":
-                freq = self.digit_freq(symbol, (0, 1))
-                freq_str = (f"P(0 and 1)={freq*100:5.1f}%"
-                            if freq is not None else "collecting")
-            else:
-                freq = self.digit_freq(symbol, (8, 9))
-                freq_str = (f"P(8 and 9)={freq*100:5.1f}%"
-                            if freq is not None else "collecting")
-
-            status_key = (symbol, eligible, self.mode,
-                          round(freq or -1, 3) if freq is not None else None)
+            status_key = (symbol, over_ok, under_ok)
             if (status_key != self.last_status.get(symbol) or
                     self.ticks_seen % 40 == 0):
-                flag = "✓ READY" if eligible else "  skip "
-                print(f"[{self.mode.upper():5}] {symbol}: {price} d={digit}  "
-                      f"{freq_str}  {flag}  barrier={self.current_barrier()}")
+                if f01 is None:
+                    freq_str = "collecting"
+                else:
+                    freq_str = f"P(0,1)={f01*100:5.1f}%  P(8,9)={f89*100:5.1f}%"
+                flag = " ".join(name for name, ok in (("OVER ✓", over_ok),
+                                                      ("UNDER ✓", under_ok)) if ok) or "skip"
+                print(f"[SCAN] {symbol}: {price} d={digit}  {freq_str}  {flag}  "
+                      f"(Over {self.current_barrier('over')}, "
+                      f"Under {self.current_barrier('under')})")
                 self.last_status[symbol] = status_key
 
             self.try_trade(ws, symbol, price)
@@ -597,11 +574,13 @@ class Bot:
             self.last_trade_ts = time.time()
             self.open_since = self.last_trade_ts
             self.open_contract = contract_id
-            print(f"Trade #{self.trades} placed  ({self.mode.upper()})  "
-                  f"contract_id={contract_id}  barrier={self.current_barrier()}")
 
             pt = self.pending_trade or {}
             self.pending_trade = None
+            strategy = pt.get("strategy") or "over"
+            self.open_strategy = strategy
+            print(f"Trade #{self.trades} placed  ({STRATEGIES[strategy]['label']})  "
+                  f"contract_id={contract_id}  barrier={pt.get('barrier')}")
             try:
                 stake = float(buy.get("buy_price") or STAKE)
             except (TypeError, ValueError):
@@ -609,8 +588,9 @@ class Bot:
             rec = {
                 "n": self.trades, "contract_id": contract_id,
                 "symbol": pt.get("symbol", "?"),
-                "contract_type": pt.get("contract_type", self.contract_type()),
-                "barrier": pt.get("barrier", self.current_barrier()),
+                "contract_type": pt.get("contract_type", STRATEGIES[strategy]["contract"]),
+                "barrier": pt.get("barrier", self.current_barrier(strategy)),
+                "strategy": strategy,
                 "stake": stake, "status": "open", "profit": None,
                 "t_open": time.time(), "t_close": None,
             }
@@ -648,12 +628,16 @@ class Bot:
                 rec["t_close"] = time.time()
                 self.note("info", f"Trade #{rec['n']} {rec['status']}: {profit:+.2f}")
 
-            if profit > 0:
-                self.on_win()
-            else:
-                self.on_loss()
+            # Only the strategy that placed this trade moves its own barrier ladder.
+            key = (rec or {}).get("strategy") or self.open_strategy
+            if key in STRATEGIES:
+                if profit > 0:
+                    self.on_win(key)
+                else:
+                    self.on_loss(key)
 
             self.open_contract = None
+            self.open_strategy = None
 
         elif t in ("ping", "pong", "authorize", "time"):
             pass
@@ -687,13 +671,11 @@ def run_session(bot: Bot):
         print(f"  subscribed: {sym}")
 
     print(f"\nMode: {ACCOUNT_TYPE} | trading={'ON' if TRADING_ENABLED else 'OFF'}")
-    print(f"Starting strategy: OVER (Over 0)")
+    print("Strategies: OVER (Over 0) and UNDER (Under 9), scanned at the same time")
     print(f"  OVER  barriers: {OVER_BARRIERS}")
-    print(f"         filter : P(0 and 1) < 10 %")
+    print(f"         filter : P(0 and 1) < {MAX_01_FREQUENCY*100:.0f} %")
     print(f"  UNDER barriers: {UNDER_BARRIERS}")
-    print(f"         filter : P(8 and 9) < 10 %")
-    print(f"Switch after {NO_MATCH_LIMIT} consecutive no-match checks "
-          f"(every {MODE_CHECK_SECS}s)")
+    print(f"         filter : P(8 and 9) < {MAX_89_FREQUENCY*100:.0f} %")
     print(f"Stop-loss ${STOP_LOSS} | Take-profit ${TAKE_PROFIT}\n")
 
     last_ping    = time.time()
