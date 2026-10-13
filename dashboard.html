@@ -10,46 +10,53 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg: #F4F6F5;
-  --ink: #14202A;
-  --muted: #566772;
-  --rule: #D5DDD9;
-  --accent: #1D4FA8;
-  --win: #0B7F5B;
-  --loss: #BD2F34;
-  --warn-ink: #7A4A00;
-  --warn-bg: #FBEFD2;
-  --err-bg: #FBE3E3;
-  --ok-bg: #DDF1E8;
-  --info-bg: #E3EBF8;
-  --low-bg: #F9E3B4;  --low-fg: #6B3F00;
-  --high-bg: #D5E3FF; --high-fg: #173F8F;
-  --mid-bg: #E5EAE7;  --mid-fg: #3A4852;
-  --demo-bg: #D5E3FF; --demo-fg: #173F8F;
-  --real-bg: #BD2F34; --real-fg: #FFFFFF;
-  --flash: #FFF1BE;
+  --bg: #F0F3F5;
+  --surface: #FFFFFF;
+  --ink: #0F1A24;
+  --muted: #5A6B78;
+  --rule: #D8E0E6;
+  --accent: #2563EB;
+  --accent-soft: #DBEAFE;
+  --win: #059669;
+  --loss: #DC2626;
+  --warn-ink: #B45309;
+  --warn-bg: #FEF3C7;
+  --err-bg: #FEE2E2;
+  --ok-bg: #D1FAE5;
+  --info-bg: #DBEAFE;
+  --low-bg: #FEF3C7;  --low-fg: #92400E;
+  --high-bg: #DBEAFE; --high-fg: #1E40AF;
+  --mid-bg: #E5EBF0;  --mid-fg: #374151;
+  --demo-bg: #DBEAFE; --demo-fg: #1E40AF;
+  --real-bg: #DC2626; --real-fg: #FFFFFF;
+  --flash: #FEF9C3;
+  --shadow: 0 1px 3px rgba(15,26,36,.06), 0 4px 16px rgba(15,26,36,.04);
+  --radius: 12px;
   --font: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0E151C;
-    --ink: #E6ECF1;
-    --muted: #93A3AF;
-    --rule: #25323D;
-    --accent: #8DB6FF;
-    --win: #3DD6A3;
-    --loss: #FF7B7B;
-    --warn-ink: #F3C46B;
-    --warn-bg: #2E2410;
-    --err-bg: #3A1A1C;
-    --ok-bg: #113126;
+    --bg: #0B1219;
+    --surface: #131C26;
+    --ink: #E8EEF4;
+    --muted: #8B9DAD;
+    --rule: #1E2C3A;
+    --accent: #60A5FA;
+    --accent-soft: #1E3A5F;
+    --win: #34D399;
+    --loss: #F87171;
+    --warn-ink: #FBBF24;
+    --warn-bg: #2A2110;
+    --err-bg: #3B1518;
+    --ok-bg: #0F2E22;
     --info-bg: #15263F;
-    --low-bg: #3A2C10;  --low-fg: #F3C46B;
-    --high-bg: #15294A; --high-fg: #8DB6FF;
-    --mid-bg: #1B2832;  --mid-fg: #A9B8C3;
-    --demo-bg: #15294A; --demo-fg: #8DB6FF;
-    --real-bg: #FF7B7B; --real-fg: #1A0A0A;
+    --low-bg: #3A2C10;  --low-fg: #FBBF24;
+    --high-bg: #1A2F4A; --high-fg: #93C5FD;
+    --mid-bg: #1A2733;  --mid-fg: #A8B8C6;
+    --demo-bg: #1A2F4A; --demo-fg: #93C5FD;
+    --real-bg: #F87171; --real-fg: #1A0A0A;
     --flash: #3A3212;
+    --shadow: 0 1px 3px rgba(0,0,0,.25), 0 8px 24px rgba(0,0,0,.2);
   }
 }
 * { box-sizing: border-box; }
@@ -67,24 +74,35 @@ a { color: var(--accent); }
 
 /* ---------- top bar ---------- */
 .bar {
-  position: sticky; top: 0; z-index: 5; background: var(--bg);
+  position: sticky; top: 0; z-index: 5;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--rule);
 }
 .bar-in {
-  max-width: 1180px; margin: 0 auto; padding: 10px 16px;
+  max-width: 1180px; margin: 0 auto; padding: 12px 16px;
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
 }
-.brand { font-weight: 600; font-size: 16px; letter-spacing: -0.01em; margin-right: auto; }
+.brand {
+  font-weight: 600; font-size: 17px; letter-spacing: -0.02em; margin-right: auto;
+  display: flex; align-items: center; gap: 8px;
+}
+.brand::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--win));
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
 .acct { display: flex; align-items: center; gap: 8px; }
-.badge { padding: 3px 10px; border-radius: 6px; font-weight: 600; font-size: 13px; }
+.badge { padding: 4px 11px; border-radius: 999px; font-weight: 600; font-size: 12px; letter-spacing: .02em; }
 .badge.demo { background: var(--demo-bg); color: var(--demo-fg); }
 .badge.real { background: var(--real-bg); color: var(--real-fg); }
 .acct-id { color: var(--muted); font-size: 13px; }
 .conn { display: flex; align-items: center; gap: 7px; font-weight: 500; font-size: 14px; }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
-.conn.ok .dot { background: var(--win); }
-.conn.wait .dot { background: #D99A1C; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); transition: background .3s; }
+.conn.ok .dot { background: var(--win); box-shadow: 0 0 0 3px color-mix(in srgb, var(--win) 25%, transparent); }
+.conn.wait .dot { background: #D99A1C; box-shadow: 0 0 0 3px rgba(217,154,28,.25); animation: pulse 1.4s ease infinite; }
 .conn.stop .dot { background: var(--loss); }
+@keyframes pulse { 50% { opacity: .55; } }
 .updated { color: var(--muted); font-size: 13px; display: none; }
 .errlink { font-size: 13px; font-weight: 600; color: var(--loss); }
 
@@ -116,9 +134,13 @@ main {
 .sub { color: var(--muted); font-size: 13px; }
 
 /* ---------- alerts ---------- */
-.alert { margin-top: 12px; padding: 10px 14px; border-radius: 6px; border-left: 4px solid; font-size: 14px; }
+.alert {
+  margin-top: 12px; padding: 12px 16px; border-radius: var(--radius);
+  border-left: 4px solid; font-size: 14px;
+  box-shadow: var(--shadow); background: var(--surface);
+}
 .alert strong { font-weight: 600; }
-.alert .hint { display: block; margin-top: 2px; opacity: .9; }
+.alert .hint { display: block; margin-top: 3px; opacity: .9; font-size: 13px; }
 .alert.err  { background: var(--err-bg);  border-color: var(--loss); }
 .alert.warn { background: var(--warn-bg); border-color: #D99A1C; color: var(--ink); }
 .alert.ok   { background: var(--ok-bg);   border-color: var(--win); }
@@ -363,15 +385,22 @@ function renderAlerts() {
     if (!S.trading_enabled) out += alertHtml("info", "Signals only.", "Trading is turned off, so no trades are placed.");
     if (S.stopped) {
       var r = S.stop_reason;
-      if (r === "stop_loss") out += alertHtml("err", "Stopped: stop-loss reached.", "Session loss is " + money(S.session_pl || 0) + ".", "Restart the service in Render to start a new session.");
-      else if (r === "take_profit") out += alertHtml("ok", "Stopped: take-profit reached.", "Session profit is " + money(S.session_pl || 0) + ".", "Restart the service in Render to start a new session.");
-      else if (r === "max_trades") out += alertHtml("info", "Stopped: trade limit reached.", S.limits.max_trades + " trades placed.", "Restart the service in Render to start a new session.");
+      var autoHint = S.auto_restart
+        ? ("Auto-restart in " + (S.restart_in != null ? S.restart_in + "s" : "a moment") +
+           ". Session P/L and barrier ladders will reset.")
+        : "Restart the service to start a new session.";
+      if (r === "stop_loss") out += alertHtml("err", "Stopped: stop-loss reached.", "Session loss is " + money(S.session_pl || 0) + ".", autoHint);
+      else if (r === "take_profit") out += alertHtml("ok", "Stopped: take-profit reached.", "Session profit is " + money(S.session_pl || 0) + ".", autoHint);
+      else if (r === "max_trades") out += alertHtml("info", "Stopped: trade limit reached.", S.limits.max_trades + " trades placed.", "Restart the service to start a new session.");
       else if (r === "login") out += alertHtml("err", "Stopped: could not log in.", S.last_error || "", hint(S.last_error));
       else out += alertHtml("info", "Stopped.", "");
     } else if (!S.bot_running) {
       out += alertHtml("err", "The bot is not running.", S.last_error || "It has not been started.", hint(S.last_error));
     } else if (!S.connected && S.last_error) {
       out += alertHtml("warn", "Reconnecting.", S.last_error, hint(S.last_error));
+    }
+    if (S.session_count > 0) {
+      /* session badge is informational only – no alert */
     }
     if (!S.protected) out += alertHtml("warn", "This page is public.", "Anyone with the link can see your balance and trades.", "Set STATUS_KEY in Render to protect it.");
   }
@@ -393,6 +422,9 @@ function renderHeader() {
     (S.account.id ? '<span class="acct-id">' + esc(S.account.id) + "</span>" : "");
   var cls, txt;
   if (failures >= 2) { cls = "stop"; txt = "Offline"; }
+  else if (S.stopped && S.restart_in != null && S.auto_restart) {
+    cls = "wait"; txt = "Restarting in " + S.restart_in + "s";
+  }
   else if (S.stopped) { cls = "stop"; txt = "Stopped"; }
   else if (!S.bot_running) { cls = "stop"; txt = "Not running"; }
   else if (S.connected) { cls = "ok"; txt = "Connected"; }

@@ -1,12 +1,21 @@
 # derivover
 
 Deriv Digit Over/Under bot (new Deriv API: App ID + `pat_` token + OTP).
+
 Scans **Over 0** and **Under 9** at the same time: every tick of every market is checked against both filters, and the first market that passes either one is traded (one trade open at a time). Each strategy keeps its own barrier ladder. See the docstring in `under9.py` for the full strategy.
 
-## Run
+## Features
+
+- Dual scanner: Over 0 + Under 9 work together; best eligible market is traded
+- Automatic session restart after stop-loss or take-profit (configurable)
+- Live dashboard (desktop + phone) with digit scanner, ladder, trades, events
+- Cloudflare free-tier cron worker to keep free hosts awake
+- Self-keepalive on Render free tier
+
+## Run locally
 
 ```bash
-pip install -r requirements.txt        # only websocket-client is needed to run the bot
+pip install -r requirements.txt        # websocket-client (+ flask if you want the dashboard)
 export DERIV_APP_ID="your_app_id"
 export DERIV_TOKEN="pat_your_token"    # needs the trade scope
 python3 under9.py
@@ -14,23 +23,58 @@ python3 under9.py
 
 On Pydroid (Android), set the two values with `os.environ[...] = "..."` at the top of a private launcher script, not in `under9.py`.
 
+## Config (top of `under9.py`)
+
+| Setting | Default | Notes |
+|--------|---------|--------|
+| `ACCOUNT_TYPE` | `"demo"` | `"demo"` or `"real"` – never falls back to the other type |
+| `STAKE` | `1.0` | Per trade |
+| `STOP_LOSS` | `3.0` | Session loss that stops trading |
+| `TAKE_PROFIT` | `7.5` | Session profit that stops trading |
+| `AUTO_RESTART_AFTER_SL_TP` | `True` | After SL/TP, wait then start a new session (P/L + ladders reset) |
+| `RESTART_DELAY_SECS` | `45` | Pause between sessions |
+| `MAX_TRADES` | `50` | Hard stop for the process (no auto-restart) |
+
 ## Deploy on Render (web service)
 
-- Build command: `pip install -r requirements.txt`
-- Start command: `gunicorn under9:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120`
-  (keep `--workers 1`, otherwise several copies of the bot would trade at once)
-- Environment variables: `DERIV_APP_ID`, `DERIV_TOKEN`, and optionally `STATUS_KEY`
-- The bot starts by itself in a background thread when the service starts.
-- Open your Render URL to see the dashboard: real or demo account, balance, session profit or loss, every trade, the digit scanner, the strategy ladder and a list of events and errors. It works on desktop and phone.
-- Set `STATUS_KEY` in Render to protect the dashboard. The page then asks for that key once and remembers it on that device. Without it, anyone with the link can see your balance and trades (the page warns you).
-- `/health` is a tiny public check for uptime monitors. `/api/state` is the data behind the dashboard (also at `/status`) and needs the key when `STATUS_KEY` is set.
-- Files needed in the repo: `under9.py`, `dashboard.html`, `requirements.txt`.
-- Render's free tier sleeps a service after ~15 minutes without web traffic, which stops the bot. On Render the bot pings its own `/health` every 10 minutes to stay awake (set `KEEPALIVE=0` to turn that off). For extra safety, also ping `/health` every 5 minutes from an uptime monitor, or use a paid instance.
-- The bot starts in the web process itself and is restarted automatically if its thread is missing (for example after `--preload` forks a worker), so exactly one bot trades. A bot stopped by stop-loss, take-profit or the trade limit stays stopped until you restart the service.
-- A restart (deploy, crash, sleep) resets the session's profit/loss counters, so stop-loss and take-profit start fresh.
+- Build: `pip install -r requirements.txt`
+- Start: `gunicorn under9:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120`  
+  (keep `--workers 1` so only one bot trades)
+- Env vars: `DERIV_APP_ID`, `DERIV_TOKEN`, optionally `STATUS_KEY`
+- Open your Render URL for the dashboard
+- `/health` is public (for uptime / Cloudflare cron). `/api/state` needs the key when `STATUS_KEY` is set
+
+Render free tier sleeps after ~15 min without traffic. The bot pings its own `/health` every 10 min when `RENDER_EXTERNAL_URL` is set (`KEEPALIVE=0` turns that off).
+
+## Cloudflare free cron (recommended on free hosts)
+
+Keeps the service awake without relying only on Render’s self-ping.
+
+1. Cloudflare dashboard → **Workers & Pages** → Create Worker
+2. Paste the contents of [`cloudflare-cron/worker.js`](cloudflare-cron/worker.js)
+3. Settings → Variables → add secret **`BOT_URL`** = `https://your-app.onrender.com` (no trailing slash)
+4. Settings → Triggers → Cron Triggers → Add: `*/5 * * * *` (every 5 minutes)
+5. Deploy. Open the Worker URL once to smoke-test; check Logs for `200` responses
+
+Optional CLI: see `cloudflare-cron/wrangler.toml`.
+
+Free tier allows ~100k requests/day — a 5-minute ping is trivial.
+
+## Token / free tier
+
+- Use a **demo** account and a token with the **trade** scope while testing.
+- Deriv App ID + `pat_…` token are required (new API). If login fails, the dashboard shows the error; common causes: wrong App ID, token missing trade scope, or no account of the configured type (`demo`/`real`).
+- Free hosting (Render free, etc.) is supported; pair it with the Cloudflare cron above.
 
 ## Safety
 
 - Credentials are read from the environment only. Never commit them.
 - `ACCOUNT_TYPE = "demo"` by default. If no account of that type exists, the bot stops instead of using another account.
 - Stake, stop-loss, take-profit and max trades are constants at the top of `under9.py`. Test on demo first.
+
+## Files
+
+- `under9.py` – bot + Flask dashboard server
+- `dashboard.html` – live UI
+- `requirements.txt` – flask, websocket-client, gunicorn
+- `cloudflare-cron/` – free keep-alive Worker

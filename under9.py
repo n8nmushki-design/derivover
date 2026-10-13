@@ -65,12 +65,21 @@ MAX_TRADES        = 50
 STOP_LOSS         = 3.0
 TAKE_PROFIT       = 7.5
 
+# After stop-loss or take-profit, automatically start a new session
+# (resets session P/L counters and barrier ladders). Set to False to
+# keep the old behaviour of staying stopped until the process restarts.
+AUTO_RESTART_AFTER_SL_TP = True
+RESTART_DELAY_SECS       = 45   # pause after SL/TP before the new session starts
+
 # ----- Strategy definitions -----
 OVER_BARRIERS  = [0, 5, 5, 6, 6, 7, 7, 8, 8]
 UNDER_BARRIERS = [9, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1]
 
 PENDING_TIMEOUT = 20           # give up on a trade request Deriv never answered (seconds)
 OPEN_CHECK_SECS  = 30           # re-check a contract that has not settled after this long
+# After "Unknown contract proposal" (or similar buy failures) wait this long
+# before trying again so the dashboard is not flooded with errors.
+BUY_ERROR_COOLDOWN = 8
 
 CANDIDATE_SYMBOLS = [
     "R_10", "R_25", "R_50", "R_75", "R_100",
@@ -248,6 +257,8 @@ class Bot:
         self.pending_since   = 0.0
         self.open_since      = 0.0
         self.stop_reason     = None
+        self.restart_at      = None                  # when AUTO_RESTART: resume after this time
+        self.session_count   = 0                     # how many sessions started this process
 
     # ---------- dashboard helpers ----------
     def note(self, level: str, msg: str):
@@ -257,7 +268,8 @@ class Bot:
                                     "msg": str(msg)[:300]})
 
     def request_stop(self, reason: str, msg: str | None = None, level: str = "info"):
-        """Stop the bot. The first reason wins."""
+        """Stop the bot. The first reason wins.
+        For stop_loss / take_profit, optionally schedule an auto-restart."""
         with self.lock:
             if self.stop:
                 return
@@ -266,6 +278,35 @@ class Bot:
             if msg:
                 print(msg)
                 self.note(level, msg)
+            if (AUTO_RESTART_AFTER_SL_TP
+                    and reason in ("stop_loss", "take_profit")):
+                self.restart_at = time.time() + RESTART_DELAY_SECS
+                self.note("info",
+                          f"Auto-restart in {RESTART_DELAY_SECS}s "
+                          f"(new session after {reason.replace('_', '-')}).")
+
+    def reset_session(self):
+        """Clear session P/L, barrier ladders and counters so a new run can start.
+        Keeps digit history, connection state and the trade log for the dashboard."""
+        with self.lock:
+            self.idx = {"over": 0, "under": 0}
+            self.open_strategy = None
+            self.trades = 0
+            self.pending = False
+            self.pending_trade = None
+            self.pending_since = 0.0
+            self.open_contract = None
+            self.open_since = 0.0
+            self.last_trade_ts = 0.0
+            self.start_balance = self.balance   # next session P/L starts from current balance
+            self.stop = False
+            self.stop_reason = None
+            self.restart_at = None
+            self.session_count += 1
+            self.note("info", f"Session #{self.session_count} started "
+                              f"(P/L counters and barrier ladders reset).")
+            print(f"\n=== Session #{self.session_count} started "
+                  f"(balance baseline {self.balance}) ===\n")
 
     def snapshot(self, running: bool, protected: bool) -> dict:
         """Everything the dashboard shows, as plain JSON-safe data."""
@@ -309,11 +350,17 @@ class Bot:
                 "t_open": r["t_open"],
             } for r in reversed(self.trade_log)][:100]
 
+            restart_in = None
+            if self.restart_at and self.stop:
+                restart_in = max(0, round(self.restart_at - time.time()))
             return {
                 "bot_running": running,
                 "connected": self.connected,
                 "stopped": self.stop,
                 "stop_reason": self.stop_reason,
+                "restart_in": restart_in,
+                "auto_restart": AUTO_RESTART_AFTER_SL_TP,
+                "session_count": self.session_count,
                 "last_error": self.last_error,
                 "protected": protected,
                 "trading_enabled": TRADING_ENABLED,
@@ -434,16 +481,22 @@ class Bot:
         self.pending_since = time.time()
         self.pending_trade = {"symbol": symbol, "contract_type": ctype,
                               "barrier": int(barrier), "strategy": key}
+        # Buy with parameters directly (buy: 1). Avoids the short-lived
+        # proposal-id race that causes "Unknown contract proposal" on 1-tick
+        # digit contracts.
         ws.send(json.dumps({
-            "proposal": 1,
-            "amount": STAKE,
-            "basis": "stake",
-            "contract_type": ctype,
-            "currency": self.currency,
-            "duration": DURATION_TICKS,
-            "duration_unit": "t",
-            "underlying_symbol": symbol,
-            "barrier": barrier,
+            "buy": 1,
+            "price": STAKE,
+            "parameters": {
+                "amount": STAKE,
+                "basis": "stake",
+                "contract_type": ctype,
+                "currency": self.currency,
+                "duration": DURATION_TICKS,
+                "duration_unit": "t",
+                "underlying_symbol": symbol,
+                "barrier": barrier,
+            },
         }))
 
     def handle(self, ws, msg: dict):
@@ -472,6 +525,11 @@ class Bot:
             self.note("error", "Deriv rejected a request: " + text)
             self.pending = False
             self.pending_trade = None
+            # Slow down after buy/proposal failures so we do not spam the API
+            # and flood the Events list with the same error every 2 seconds.
+            low = text.lower()
+            if "unknown contract proposal" in low or "proposal" in low or "buy" in low:
+                self.last_trade_ts = time.time() + (BUY_ERROR_COOLDOWN - COOLDOWN_SECONDS)
             return
 
         t = msg.get("msg_type")
@@ -547,23 +605,15 @@ class Bot:
                     self.request_stop("take_profit",
                                       f"Take-profit ${TAKE_PROFIT:.2f} reached – stopping.")
 
-        # ---- proposal → buy ----
+        # ---- legacy proposal reply (we now buy with parameters directly) ----
         elif t == "proposal":
-            if not self.pending:
-                return          # late answer to a request that already timed out
+            # Kept only for safety if a stale proposal reply arrives.
+            # Direct-buy flow does not depend on proposal IDs.
             prop = msg.get("proposal") or {}
             prop_id = prop.get("id")
-            if not prop_id:
-                print("Proposal missing id:", json.dumps(msg)[:250])
-                self.note("error", "Deriv sent a proposal without an id, trade skipped")
-                self.pending = False
-                self.pending_trade = None
-                return
-            print(f"  Proposal OK – buying id={prop_id}")
-            ws.send(json.dumps({
-                "buy": prop_id,
-                "price": STAKE,
-            }))
+            if prop_id and self.pending:
+                print(f"  (legacy) Proposal id={prop_id} – ignored; using direct buy")
+            return
 
         # ---- buy confirmation ----
         elif t == "buy":
@@ -712,10 +762,24 @@ def run_session(bot: Bot):
             pass
 
 def run_forever(bot: Bot):
-    """Run sessions with auto-reconnect until the bot stops or login fails."""
+    """Run sessions with auto-reconnect. On SL/TP, optionally restart a new session."""
     delay = 3
 
-    while not bot.stop:
+    while True:
+        # Wait out a scheduled auto-restart (SL/TP) then reset session counters.
+        if bot.stop and bot.restart_at and AUTO_RESTART_AFTER_SL_TP:
+            remaining = bot.restart_at - time.time()
+            if remaining > 0:
+                print(f"Waiting {remaining:.0f}s before auto-restart …")
+                time.sleep(min(remaining, 5))
+                continue
+            bot.reset_session()
+            delay = 3
+            continue
+
+        if bot.stop:
+            break
+
         try:
             run_session(bot)
             delay = 3
@@ -737,8 +801,10 @@ def run_forever(bot: Bot):
             print(bot.last_error)
             bot.note("error", bot.last_error)
 
-        if bot.stop:
+        if bot.stop and not (bot.restart_at and AUTO_RESTART_AFTER_SL_TP):
             break
+        if bot.stop:
+            continue
         print(f"Reconnecting in {delay}s …\n")
         time.sleep(delay)
         delay = min(delay * 2, 60)
@@ -774,8 +840,12 @@ _keepalive  = None
 KEEPALIVE_SECS = 600
 
 def bot_running() -> bool:
-    return bool(_thread and _thread.is_alive() and _owner_pid == os.getpid()
-                and not BOT.stop)
+    """True while the bot thread is alive and either trading or waiting to auto-restart."""
+    if not (_thread and _thread.is_alive() and _owner_pid == os.getpid()):
+        return False
+    if BOT.stop and not (BOT.restart_at and AUTO_RESTART_AFTER_SL_TP):
+        return False
+    return True
 
 def _keepalive_loop(url: str):
     while True:
@@ -801,8 +871,12 @@ def start_background_bot() -> bool:
             return False
         if _thread is not None and mine:
             BOT.note("warn", "The bot thread had stopped, starting it again")
-        BOT.stop = False
-        BOT.stop_reason = None
+        # Fresh process / crashed thread: clear any leftover permanent stop.
+        # If we are mid auto-restart window, reset_session will run inside run_forever.
+        if BOT.stop and not (BOT.restart_at and AUTO_RESTART_AFTER_SL_TP):
+            BOT.stop = False
+            BOT.stop_reason = None
+            BOT.restart_at = None
         BOT.last_error = None
         _thread = threading.Thread(target=run_forever, args=(BOT,),
                                    daemon=True, name="deriv-bot")
@@ -820,10 +894,16 @@ def start_background_bot() -> bool:
 def ensure_bot() -> None:
     """Cheap check run on every web request: start the bot in THIS process if
     it is not running (first request, crashed thread, or a forked gunicorn
-    worker). A bot stopped on purpose (stop-loss, take-profit) stays stopped."""
-    if BOT.stop or os.environ.get("DERIV_AUTOSTART", "1") != "1":
+    worker). A bot stopped for SL/TP with auto-restart scheduled is left alone
+    — the existing thread is waiting out RESTART_DELAY_SECS. Permanent stops
+    (login, max trades, user) stay stopped."""
+    if os.environ.get("DERIV_AUTOSTART", "1") != "1":
         return
+    # Thread still alive (including waiting for auto-restart) — nothing to do.
     if _thread and _thread.is_alive() and _owner_pid == os.getpid():
+        return
+    # Permanent stop and the thread has already exited — do not resurrect.
+    if BOT.stop and not (BOT.restart_at and AUTO_RESTART_AFTER_SL_TP):
         return
     start_background_bot()
 
