@@ -1,0 +1,13 @@
+# Optional: use with `npx wrangler deploy` if you prefer the CLI.
+# Or just paste worker.js in the Cloudflare dashboard (no CLI needed).
+
+name = "derivover-keepalive"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Set BOT_URL as a secret in the dashboard or:
+#   npx wrangler secret put BOT_URL
+# Value example: https://your-service.onrender.com
+
+[triggers]
+crons = ["*/5 * * * *"]
