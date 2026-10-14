@@ -1187,7 +1187,7 @@ if hasattr(os, "register_at_fork"):
                         after_in_child=_after_fork_child)
 
 try:
-    from flask import Flask, Response, jsonify, request
+    from flask import Flask, Response, jsonify, request, send_from_directory
 except ImportError:      # plain local run without Flask
     app = None
 else:
@@ -1222,6 +1222,11 @@ else:
         resp = Response(html, mimetype="text/html")
         resp.headers["Cache-Control"] = "no-cache"
         return resp
+
+    @app.route("/static/<path:filename>")
+    def static_files(filename):
+        static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+        return send_from_directory(static_dir, filename)
 
     @app.route("/health")
     def health():
