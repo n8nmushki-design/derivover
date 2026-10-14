@@ -43,6 +43,12 @@ import urllib.error
 import urllib.request
 from collections import defaultdict, deque
 
+# Optional Supabase persistence (never hard-fail if missing)
+try:
+    from supabase_store import STORE as SUPA
+except Exception:
+    SUPA = None  # type: ignore
+
 from websocket import (
     create_connection,
     WebSocketTimeoutException,
@@ -62,7 +68,7 @@ STAKE             = 1.0
 DURATION_TICKS    = 1
 COOLDOWN_SECONDS  = 3
 MAX_TRADES        = 50
-TRADE_LIMIT_REFRESH_SECS = 300   # auto-reset trade counter every 5 minutes
+TRADE_LIMIT_REFRESH_SECS = 300   # wait this long AFTER limit is hit, then auto-reset
 STOP_LOSS         = 3.0
 TAKE_PROFIT       = 7.5
 
@@ -182,6 +188,10 @@ def find_wss(obj):
 # The account the bot is trading on (shown on the dashboard).
 ACCOUNT = {"id": None, "type": ACCOUNT_TYPE}
 
+def _supa():
+    """Return Supabase store or None (never raises NameError)."""
+    return globals().get("SUPA")
+
 def account_id_of(a: dict):
     for key in ("account_id", "accountId", "id", "loginid"):
         if a.get(key):
@@ -298,7 +308,8 @@ class Bot:
         self.manual_symbol   = None                  # optional one-shot force symbol
         self.manual_strategy = None                  # "over" | "under" | None (auto)
         self.manual_skip_filter = False              # manual trade: ignore digit filter once
-        self.trades_window_started = time.time()     # when current trade-limit window began
+        self.trades_window_started = time.time()     # session start (legacy)
+        self.limit_hit_at = None                     # set only when MAX_TRADES is hit
         self.limit_refresh_count = 0                 # how many times limit was refreshed
 
     # ---------- dashboard helpers ----------
@@ -354,6 +365,11 @@ class Bot:
                           f"Auto-restart in {RESTART_DELAY_SECS}s "
                           f"(new session after {reason.replace('_', '-')}).")
 
+        try:
+            self._supa_end_session(reason)
+        except Exception:
+            pass
+
     def set_paused(self, paused: bool):
         with self.lock:
             if self.stop:
@@ -387,6 +403,7 @@ class Bot:
             prev = self.trades
             self.trades = 0
             self.trades_window_started = time.time()
+            self.limit_hit_at = None
             self.limit_refresh_count = getattr(self, "limit_refresh_count", 0) + 1
             self._limit_warned = False
             cleared_stop = False
@@ -409,15 +426,27 @@ class Bot:
             }
 
     def maybe_auto_refresh_trade_limit(self) -> None:
-        """If the 5-minute window elapsed, reset the trade counter automatically."""
-        started = getattr(self, "trades_window_started", None) or 0.0
-        if started <= 0:
+        """Auto-reset only after the trade limit is reached, then wait REFRESH_SECS."""
+        if self.trades < MAX_TRADES:
+            # Not at limit – clear any previous "hit" timer
+            if getattr(self, "limit_hit_at", None):
+                with self.lock:
+                    self.limit_hit_at = None
+            return
+        # At limit: start timer on first hit
+        hit = getattr(self, "limit_hit_at", None)
+        if not hit:
             with self.lock:
-                self.trades_window_started = time.time()
+                self.limit_hit_at = time.time()
+            self.note(
+                "warn",
+                f"Trade limit {MAX_TRADES} reached – auto-refresh in {TRADE_LIMIT_REFRESH_SECS // 60} min "
+                f"(or tap Refresh limit)",
+            )
             return
-        if time.time() - started < TRADE_LIMIT_REFRESH_SECS:
+        if time.time() - hit < TRADE_LIMIT_REFRESH_SECS:
             return
-        self.refresh_trade_limit(reason="auto-5min")
+        self.refresh_trade_limit(reason="auto-after-limit")
 
     def control(self, action: str, **kwargs) -> dict:
         """Dashboard control actions. Returns {ok, message}."""
@@ -486,6 +515,70 @@ class Bot:
             return {"ok": True, "message": "Session reset"}
         return {"ok": False, "message": f"Unknown action: {action}"}
 
+
+    def _session_stats(self):
+        closed = [r for r in self.trade_log if r.get("status") in ("won", "lost")]
+        wins = sum(1 for r in closed if r["status"] == "won")
+        losses = len(closed) - wins
+        pl = None
+        if self.balance is not None and self.start_balance is not None:
+            pl = round(self.balance - self.start_balance, 2)
+        return {
+            "trades_count": len(closed),
+            "wins": wins,
+            "losses": losses,
+            "session_pl": pl,
+            "end_balance": self.balance,
+        }
+
+    def _supa_start_session(self):
+        store = _supa()
+        if not store:
+            return
+        try:
+            store.start_session(
+                account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                account_id=ACCOUNT.get("id"),
+                session_no=getattr(self, "session_count", 1) or 1,
+                start_balance=self.start_balance if self.start_balance is not None else self.balance,
+                currency=self.currency or "USD",
+            )
+        except Exception as e:
+            self.note("warn", f"Supabase session start failed: {e}")
+
+    def _supa_end_session(self, reason=None):
+        store = _supa()
+        if not store:
+            return
+        try:
+            st = self._session_stats()
+            store.end_session(
+                end_balance=st["end_balance"],
+                session_pl=st["session_pl"],
+                trades_count=st["trades_count"],
+                wins=st["wins"],
+                losses=st["losses"],
+                stop_reason=reason or self.stop_reason,
+            )
+        except Exception as e:
+            self.note("warn", f"Supabase session end failed: {e}")
+
+    def _supa_update_session(self):
+        store = _supa()
+        if not store:
+            return
+        try:
+            st = self._session_stats()
+            store.update_session_pl(
+                end_balance=st["end_balance"],
+                session_pl=st["session_pl"],
+                trades_count=st["trades_count"],
+                wins=st["wins"],
+                losses=st["losses"],
+            )
+        except Exception as e:
+            print(f"[supabase] update session: {e}", flush=True)
+
     def reset_session(self):
         """Clear session P/L, barrier ladders and counters so a new run can start.
         Keeps digit history, connection state and the trade log for the dashboard."""
@@ -508,6 +601,10 @@ class Bot:
                               f"(P/L counters and barrier ladders reset).")
             print(f"\n=== Session #{self.session_count} started "
                   f"(balance baseline {self.balance}) ===\n")
+            try:
+                self._supa_start_session()
+            except Exception:
+                pass
 
     def snapshot(self, running: bool, protected: bool) -> dict:
         """Everything the dashboard shows, as plain JSON-safe data."""
@@ -581,9 +678,9 @@ class Bot:
                 "protected": protected,
                 "trading_enabled": TRADING_ENABLED,
                 "supabase": {
-                    "enabled": bool(SUPA and getattr(SUPA, "enabled", False)),
-                    "session_id": getattr(SUPA, "current_session_id", None) if SUPA else None,
-                    "last_error": getattr(SUPA, "last_error", None) if SUPA else None,
+                    "enabled": bool(_supa() and getattr(_supa(), "enabled", False)),
+                    "session_id": getattr(_supa(), "current_session_id", None) if _supa() else None,
+                    "last_error": getattr(_supa(), "last_error", None) if _supa() else None,
                 },
                 "account": dict(ACCOUNT),
                 "currency": self.currency,
@@ -596,7 +693,12 @@ class Bot:
                     "take_profit": TAKE_PROFIT,
                     "stake": STAKE,
                     "refresh_secs": TRADE_LIMIT_REFRESH_SECS,
-                    "refresh_in": max(0, int(TRADE_LIMIT_REFRESH_SECS - (time.time() - (getattr(self, "trades_window_started", time.time()) or time.time())))),
+                    "refresh_in": (
+                        max(0, int(TRADE_LIMIT_REFRESH_SECS - (time.time() - self.limit_hit_at)))
+                        if getattr(self, "limit_hit_at", None) and self.trades >= MAX_TRADES
+                        else None
+                    ),
+                    "limit_reached": self.trades >= MAX_TRADES,
                     "limit_refresh_count": getattr(self, "limit_refresh_count", 0),
                 },
                 "stats": {"trades": self.trades, "wins": wins, "losses": losses,
@@ -688,9 +790,7 @@ class Bot:
         self.maybe_auto_refresh_trade_limit()
         if self.trades >= MAX_TRADES:
             # Soft block – do not kill the bot thread; wait for refresh button / auto timer
-            if not getattr(self, "_limit_warned", False):
-                self.note("warn", f"Trade limit {MAX_TRADES} reached – waiting for refresh (auto every {TRADE_LIMIT_REFRESH_SECS // 60} min)")
-                self._limit_warned = True
+            # Timer starts in maybe_auto_refresh_trade_limit (only after limit hit)
             return None
         if self.manual_strategy:
             key = self.manual_strategy
@@ -841,7 +941,7 @@ class Bot:
                 if self.session_count == 0:
                     self.session_count = 1
                 try:
-                    if SUPA and not getattr(SUPA, "current_session_id", None):
+                    if _supa() and not getattr(_supa(), "current_session_id", None):
                         self._supa_start_session()
                 except Exception as e:
                     print(f"[supabase] first session: {e}", flush=True)
@@ -904,6 +1004,18 @@ class Bot:
             self.trade_log.append(rec)
             kind = "Over" if rec["contract_type"] == "DIGITOVER" else "Under"
             self.note("info", f"Trade #{rec['n']} placed: {rec['symbol']} {kind} {rec['barrier']}")
+            try:
+                store = _supa()
+                if store:
+                    store.save_trade_open(
+                        rec,
+                        account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                        account_id=ACCOUNT.get("id"),
+                        currency=self.currency or "USD",
+                    )
+                    self._supa_update_session()
+            except Exception as e:
+                print(f"[supabase] save open trade: {e}", flush=True)
 
             if contract_id:
                 ws.send(json.dumps({
@@ -935,8 +1047,8 @@ class Bot:
                 rec["t_close"] = time.time()
                 self.note("info", f"Trade #{rec['n']} {rec['status']}: {profit:+.2f}")
                 try:
-                    if SUPA:
-                        SUPA.save_trade_close(
+                    if _supa():
+                        _supa().save_trade_close(
                             rec,
                             account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
                         )
@@ -1358,6 +1470,39 @@ else:
         resp = jsonify(payload)
         resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    @app.route("/api/history/sessions")
+    def api_history_sessions():
+        if not key_ok():
+            return jsonify(error="forbidden"), 403
+        if not _supa() or not getattr(_supa(), "enabled", False):
+            return jsonify(enabled=False, sessions=[], message="Supabase not configured")
+        at = (request.args.get("account_type") or ACCOUNT_TYPE or "").strip().lower()
+        if at not in ("demo", "real"):
+            at = None
+        try:
+            limit = int(request.args.get("limit") or 30)
+        except ValueError:
+            limit = 30
+        rows = _supa().list_sessions(account_type=at, limit=limit)
+        return jsonify(enabled=True, account_type=at or "all", sessions=rows)
+
+    @app.route("/api/history/trades")
+    def api_history_trades():
+        if not key_ok():
+            return jsonify(error="forbidden"), 403
+        if not _supa() or not getattr(_supa(), "enabled", False):
+            return jsonify(enabled=False, trades=[], message="Supabase not configured")
+        at = (request.args.get("account_type") or ACCOUNT_TYPE or "").strip().lower()
+        if at not in ("demo", "real"):
+            at = None
+        sid = (request.args.get("session_id") or "").strip() or None
+        try:
+            limit = int(request.args.get("limit") or 50)
+        except ValueError:
+            limit = 50
+        rows = _supa().list_trades(account_type=at, session_id=sid, limit=limit)
+        return jsonify(enabled=True, account_type=at or "all", session_id=sid, trades=rows)
 
     @app.route("/api/control", methods=["POST"])
     def api_control():

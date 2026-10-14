@@ -449,8 +449,8 @@ function renderStats(){
   var lim=S.limits||{};
   var used=st.trades!=null?st.trades:0;
   var max=lim.max_trades!=null?lim.max_trades:50;
-  var atLimit=used>=max;
-  var refreshIn=lim.refresh_in!=null?lim.refresh_in:null;
+  var atLimit=!!lim.limit_reached||used>=max;
+  var refreshIn=lim.refresh_in;
   var tradesCard=
     '<div class="rounded-xl bg-surface-container border border-outline-variant/20 p-3 lg:p-4">'+
       '<div class="flex items-center justify-between mb-1 gap-2">'+
@@ -461,8 +461,9 @@ function renderStats(){
       '</div>'+
       '<div class="text-lg font-semibold '+(atLimit?"text-primary":"")+'">'+used+" / "+max+'</div>'+
       '<div class="text-[11px] text-on-surface-variant mt-0.5">'+
-        (atLimit?"Limit reached · ":"Max allowed · ")+
-        (refreshIn!=null?("auto refresh in "+fmtRemain(refreshIn)):"auto every 5 min")+
+        (atLimit
+          ? (refreshIn!=null?("Auto-refresh in "+fmtRemain(refreshIn)+" · or tap Refresh"):"Waiting for refresh · tap Refresh limit")
+          : "Max allowed · auto-refreshes 5 min after limit is hit")+
       '</div>'+
     '</div>';
   var items=[
@@ -524,10 +525,16 @@ function renderTrades(){
     return true;
   });
   var list=showAll?filtered:filtered.slice(0,20);
-  $("tradeBody").innerHTML=tradeTable(list);$("dashTrades").innerHTML=tradeTable(all.slice(0,8));
+  var live=tradeTable(list);
+  var histSess='<div class="mt-4"><div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Saved sessions (Supabase)</div><div class="grid gap-2 sm:grid-cols-2">'+sessionCards(histSessions)+"</div></div>";
+  var histT='<div class="mt-4"><div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Saved trades (Supabase)</div>'+histTradeTable(histTrades)+"</div>";
+  $("tradeBody").innerHTML=live+histSess+histT;
+  $("dashTrades").innerHTML=tradeTable(all.slice(0,8));
   var more=$("tradeMore");
   if(filtered.length>20){more.innerHTML='<button type="button" id="moreBtn" class="text-xs text-primary font-medium">'+(showAll?"Show fewer":"Show all "+filtered.length)+"</button>"}
   else more.innerHTML="";
+  // Refresh history at most every 15s when on trades page
+  if(Date.now()-histLoaded>15000){loadHistory().then(function(){/* next tick will redraw */})}
 }
 
 function strategyCards(){return(S.strategies||[]).map(function(s){var cur=s.barrier_idx,b=s.barriers;var chips=b.map(function(v,i){return'<span class="chip'+(i===cur?" cur":i<cur?" past":"")+'">'+v+"</span>"}).join("");var next=cur<b.length-1?"After a loss moves to "+b[cur+1]+".":"After a loss resets to "+b[0]+".";return'<div class="rounded-lg bg-surface-container-low p-4 border border-outline-variant/15"><div class="text-[10px] font-mono uppercase text-on-surface-variant mb-1">'+esc(s.label)+' engine</div><div class="text-lg font-semibold mb-2">'+esc(s.kind)+" "+s.barrier+'</div><div class="flex flex-wrap gap-1 mb-2">'+chips+'</div><p class="text-[12px] text-on-surface-variant">'+esc(next)+" A win returns to "+b[0]+".</p></div>"}).join("")}
@@ -901,7 +908,7 @@ if(as){
   });
 })();
 
-function tick(){var headers=key?{"X-Status-Key":key}:{};return fetch("/api/state",{headers:headers,cache:"no-store"}).then(function(r){if(r.status===403){needKey=true;S=null;failures=0;render();return}if(!r.ok)throw new Error("HTTP "+r.status);return r.json().then(function(s){S=s;lastOk=Date.now();failures=0;needKey=false;render()})}).catch(function(){failures++;render()})}
+function tick(){var headers=key?{"X-Status-Key":key}:{};return fetch("/api/state",{headers:headers,cache:"no-store"}).then(function(r){if(r.status===403){needKey=true;S=null;failures=0;render();return}if(!r.ok)throw new Error("HTTP "+r.status);return r.json().then(function(s){S=s;lastOk=Date.now();failures=0;needKey=false;render();if(Date.now()-histLoaded>15000)loadHistory().then(function(){if(location.hash.indexOf("trade")>=0||document.getElementById("page-trades")&&!document.getElementById("page-trades").classList.contains("hidden"))renderTrades()})})}).catch(function(){failures++;render()})}
 function loop(){tick().then(function(){setTimeout(loop,document.hidden?8000:2000)})}
 document.addEventListener("visibilitychange",function(){if(!document.hidden)tick()});
 window.addEventListener("resize",function(){if(S)renderMarkets()});

@@ -2,12 +2,14 @@
 Supabase persistence for Derivover (PostgREST over HTTPS).
 
 Uses only the standard library so Render does not need extra packages.
-Requires:
+Enabled by default when credentials are set:
   SUPABASE_URL=https://xxxx.supabase.co
-  SUPABASE_SERVICE_ROLE_KEY=eyJ...   # server only — never expose to the browser
+  SUPABASE_SECRET_KEY=eyJ...          # preferred (service_role / secret)
+  # or SUPABASE_SERVICE_ROLE_KEY=...  # legacy name
+  # SUPABASE_ENABLED=0                # only way to force off
 
-If either var is missing, all methods no-op (bot keeps working without DB).
-Demo vs real is stored on every row via account_type.
+If URL/key are missing, methods no-op (bot still trades). Demo vs real
+are stored on every row via account_type.
 """
 
 from __future__ import annotations
@@ -33,16 +35,56 @@ def _iso(ts: float | None = None) -> str:
 
 class SupabaseStore:
     def __init__(self) -> None:
+        """Supabase is ON by default whenever URL + key are present.
+
+        Set SUPABASE_ENABLED=0 only if you want to force it off.
+        """
         self.url = _env("SUPABASE_URL").rstrip("/")
-        self.key = _env("SUPABASE_SERVICE_ROLE_KEY") or _env("SUPABASE_KEY")
-        self.enabled = bool(self.url and self.key)
+        # Key names (new Supabase dashboard + legacy):
+        #   SUPABASE_SECRET_KEY / SERVICE_ROLE_KEY  → server (full access)  ← preferred
+        #   SUPABASE_PUBLISHABLE_KEY / ANON_KEY     → fallback (needs RLS policies)
+        secret = (
+            _env("SUPABASE_SECRET_KEY")
+            or _env("SUPABASE_SERVICE_ROLE_KEY")
+            or _env("SUPABASE_KEY")
+        )
+        self.publishable = _env("SUPABASE_PUBLISHABLE_KEY") or _env("SUPABASE_ANON_KEY")
+        self.key = secret or self.publishable
+        self.using_publishable = bool(self.key and not secret and self.publishable)
+
+        # Default: enabled when credentials exist. Only SUPABASE_ENABLED=0 turns it off.
+        flag = _env("SUPABASE_ENABLED").lower()
+        force_off = flag in ("0", "false", "no", "off")
+        force_on = flag in ("1", "true", "yes", "on")
+        self.enabled = (not force_off) and bool(self.url and self.key)
+        if force_on and not self.enabled:
+            # User asked to enable but creds missing – stay off, log clearly
+            print(
+                "[supabase] SUPABASE_ENABLED=1 but URL/key missing – cannot enable",
+                flush=True,
+            )
+
         self._lock = threading.Lock()
         self.current_session_id: str | None = None
         self._last_error: str | None = None
+
         if self.enabled:
-            print(f"[supabase] enabled → {self.url}", flush=True)
+            kind = "publishable/anon" if self.using_publishable else "secret/service_role"
+            print(f"[supabase] ENABLED by default → {self.url} (key={kind})", flush=True)
+            if self.using_publishable:
+                print(
+                    "[supabase] warning: using PUBLISHABLE key. "
+                    "If inserts fail, set SUPABASE_SECRET_KEY (service_role) instead.",
+                    flush=True,
+                )
+        elif force_off:
+            print("[supabase] disabled via SUPABASE_ENABLED=0", flush=True)
         else:
-            print("[supabase] disabled (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)", flush=True)
+            print(
+                "[supabase] waiting for credentials "
+                "(set SUPABASE_URL + SUPABASE_SECRET_KEY to enable automatically)",
+                flush=True,
+            )
 
     @property
     def last_error(self) -> str | None:
@@ -255,6 +297,29 @@ class SupabaseStore:
                 payload,
                 prefer="return=minimal",
             )
+
+
+    def list_sessions(self, *, account_type: str | None = None, limit: int = 30) -> list:
+        if not self.enabled:
+            return []
+        limit = max(1, min(int(limit or 30), 100))
+        q = f"trading_sessions?select=*&order=started_at.desc&limit={limit}"
+        if account_type in ("demo", "real"):
+            q += f"&account_type=eq.{account_type}"
+        data = self._request("GET", q)
+        return data if isinstance(data, list) else []
+
+    def list_trades(self, *, account_type: str | None = None, session_id: str | None = None, limit: int = 50) -> list:
+        if not self.enabled:
+            return []
+        limit = max(1, min(int(limit or 50), 200))
+        q = f"trades?select=*&order=opened_at.desc&limit={limit}"
+        if account_type in ("demo", "real"):
+            q += f"&account_type=eq.{account_type}"
+        if session_id:
+            q += f"&session_id=eq.{session_id}"
+        data = self._request("GET", q)
+        return data if isinstance(data, list) else []
 
 
 # Singleton used by under9.py
