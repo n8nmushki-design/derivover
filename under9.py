@@ -55,7 +55,7 @@ from websocket import (
 APP_ID = os.environ.get("DERIV_APP_ID", "")
 TOKEN  = os.environ.get("DERIV_TOKEN", "")
 
-ACCOUNT_TYPE      = "demo"          # "demo" or "real"
+ACCOUNT_TYPE      = os.environ.get("ACCOUNT_TYPE", "demo").strip().lower() or "demo"  # "demo" or "real"
 TRADING_ENABLED   = True
 
 STAKE             = 1.0
@@ -119,8 +119,11 @@ BASE = "https://api.derivws.com"
 UA   = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
         "Chrome/120.0 Mobile Safari/537.36")
 
-def rest(method: str, path: str):
-    log(f"REST {method} {path}")
+def rest(method: str, path: str, timeout: float = 15.0):
+    """Call Deriv REST API. Raises ConfigError for auth problems."""
+    if not APP_ID or not TOKEN:
+        raise ConfigError("Missing DERIV_APP_ID or DERIV_TOKEN environment variables")
+    log(f"REST {method} {path} (app_id={APP_ID[:4]}… token={TOKEN[:6]}…)")
     req = urllib.request.Request(
         BASE + path,
         method=method,
@@ -134,20 +137,21 @@ def rest(method: str, path: str):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            data = json.loads(resp.read().decode())
-            log(f"REST {method} {path} -> ok")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode()
+            data = json.loads(raw) if raw else {}
+            log(f"REST {method} {path} -> ok ({len(raw)} bytes)")
             return data
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:400]
         msg  = f"HTTP {e.code} on {path}: {body}"
         log(msg)
         if e.code in (400, 401, 403):
-            raise ConfigError(msg + "\nCheck APP_ID / TOKEN (trade scope required).")
+            raise ConfigError(msg + " — check DERIV_APP_ID / DERIV_TOKEN (trade scope required).")
         raise RuntimeError(msg)
     except Exception as e:
-        log(f"REST {method} {path} failed: {e}")
-        raise
+        log(f"REST {method} {path} failed: {type(e).__name__}: {e}")
+        raise RuntimeError(f"REST {method} {path} failed: {e}")
 
 def find_list(obj):
     if isinstance(obj, list) and obj:
@@ -210,7 +214,16 @@ def account_kind(a: dict):
         return "real"
     return None
 
+def _bot_note(level: str, msg: str) -> None:
+    """Best-effort dashboard note during login (BOT may not exist yet)."""
+    try:
+        BOT.note(level, msg)
+    except Exception:
+        log(f"{level}: {msg}")
+
+
 def get_ws_url() -> str:
+    _bot_note("info", f"Fetching accounts (type={ACCOUNT_TYPE})…")
     data = rest("GET", "/trading/v1/options/accounts")
     accounts = [a for a in find_list(data) if isinstance(a, dict)]
     if not accounts:
@@ -221,18 +234,24 @@ def get_ws_url() -> str:
     if chosen is None:
         found = ", ".join(f"{account_id_of(a) or '?'}={account_kind(a) or 'unknown'}"
                           for a in accounts)
-        raise ConfigError(f"No '{ACCOUNT_TYPE}' account found (accounts: {found})")
+        raise ConfigError(
+            f"No '{ACCOUNT_TYPE}' account found (accounts: {found}). "
+            f"Set ACCOUNT_TYPE in under9.py to match your token, or use a {ACCOUNT_TYPE} token."
+        )
 
     account_id = account_id_of(chosen)
     if not account_id:
         raise RuntimeError("Could not find account id: " + json.dumps(chosen)[:300])
 
     ACCOUNT.update(id=account_id, type=ACCOUNT_TYPE)
-    print("Using account:", account_id, f"({ACCOUNT_TYPE})")
+    log(f"Using account: {account_id} ({ACCOUNT_TYPE})")
+    _bot_note("info", f"Using account {account_id} ({ACCOUNT_TYPE})")
+    _bot_note("info", "Requesting WebSocket OTP…")
     otp = rest("POST", f"/trading/v1/options/accounts/{account_id}/otp")
     url = find_wss(otp)
     if not url:
         raise RuntimeError("No WebSocket URL in OTP response: " + json.dumps(otp)[:300])
+    _bot_note("info", "OTP received — opening WebSocket")
     return url
 
 def decimals_needed(price) -> int:
@@ -869,12 +888,17 @@ def run_session(bot: Bot):
     bot.last_connect_attempt = time.time()
     bot.connected = False
     ws = None
+    if not APP_ID or not TOKEN:
+        bot.last_error = "Missing DERIV_APP_ID or DERIV_TOKEN"
+        bot.note("error", bot.last_error)
+        raise ConfigError(bot.last_error)
+    bot.note("info", f"Credentials present (app_id={APP_ID[:4]}…, token={TOKEN[:6]}…)")
     log("run_session: resolving account + OTP")
     try:
         url = get_ws_url()
     except Exception as e:
         bot.last_error = f"Login / account: {e}"
-        bot.note("error", bot.last_error)
+        bot.note("error", bot.last_error[:300])
         raise
     bot.note("info", f"Opening WebSocket (account {ACCOUNT.get('id') or '?'})")
     try:
