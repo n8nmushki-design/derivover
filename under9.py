@@ -277,8 +277,34 @@ class Bot:
         self._ws             = None
         self.manual_symbol   = None                  # optional one-shot force symbol
         self.manual_strategy = None                  # "over" | "under" | None (auto)
+        self.manual_skip_filter = False              # manual trade: ignore digit filter once
 
     # ---------- dashboard helpers ----------
+
+    def ensure_attrs(self):
+        """Fill any attributes added in newer deploys (avoids AttributeError on hot reload)."""
+        defaults = {
+            "manual_symbol": None,
+            "manual_strategy": None,
+            "manual_skip_filter": False,
+            "paused": False,
+            "reconnect_requested": False,
+            "last_connect_attempt": 0.0,
+            "thread_started_at": 0.0,
+            "_ws": None,
+            "pending_trade": None,
+            "pending_since": 0.0,
+            "open_since": 0.0,
+            "stop_reason": None,
+            "restart_at": None,
+            "session_count": 0,
+            "last_error": None,
+            "currency": "USD",
+        }
+        for k, v in defaults.items():
+            if not hasattr(self, k):
+                setattr(self, k, v)
+
     def note(self, level: str, msg: str):
         """Add a line to the event list shown on the dashboard."""
         with self.lock:
@@ -332,6 +358,7 @@ class Bot:
 
     def control(self, action: str, **kwargs) -> dict:
         """Dashboard control actions. Returns {ok, message}."""
+        self.ensure_attrs()
         action = (action or "").strip().lower()
         if action == "pause":
             ok = self.set_paused(True)
@@ -418,6 +445,7 @@ class Bot:
 
     def snapshot(self, running: bool, protected: bool) -> dict:
         """Everything the dashboard shows, as plain JSON-safe data."""
+        self.ensure_attrs()
         with self.lock:
             closed = [r for r in self.trade_log if r["status"] != "open"]
             wins   = sum(1 for r in closed if r["status"] == "won")
@@ -471,11 +499,13 @@ class Bot:
                         if self.thread_started_at else None))),
                 "stopped": self.stop,
                 "paused": self.paused,
-                "force_armed": bool(self.manual_symbol or self.manual_strategy or self.manual_skip_filter),
+                "force_armed": bool(getattr(self, "manual_symbol", None)
+                                     or getattr(self, "manual_strategy", None)
+                                     or getattr(self, "manual_skip_filter", False)),
                 "force": {
-                    "symbol": self.manual_symbol,
-                    "strategy": self.manual_strategy,
-                    "skip_filter": self.manual_skip_filter,
+                    "symbol": getattr(self, "manual_symbol", None),
+                    "strategy": getattr(self, "manual_strategy", None),
+                    "skip_filter": bool(getattr(self, "manual_skip_filter", False)),
                 },
                 "stop_reason": self.stop_reason,
                 "restart_in": restart_in,
@@ -569,6 +599,7 @@ class Bot:
 
     def can_trade(self, symbol: str) -> str | None:
         """Return the strategy to trade on this market now, or None."""
+        self.ensure_attrs()
         if self.stop or self.paused or self.pending or self.open_contract:
             return None
         if self.manual_symbol and symbol != self.manual_symbol:
@@ -581,14 +612,14 @@ class Bot:
             return None
         if self.manual_strategy:
             key = self.manual_strategy
-            if self.manual_skip_filter or self.is_eligible(symbol, key):
+            if getattr(self, 'manual_skip_filter', False) or self.is_eligible(symbol, key):
                 return key
             return None
         if self.manual_symbol:
             key = self.pick_strategy(symbol)
             if key:
                 return key
-            if self.manual_skip_filter:
+            if getattr(self, 'manual_skip_filter', False):
                 return "over"
             return None
         return self.pick_strategy(symbol)
@@ -1177,7 +1208,39 @@ else:
     def api_state():
         if not key_ok():
             return jsonify(error="forbidden"), 403
-        resp = jsonify(BOT.snapshot(bot_running(), bool(os.environ.get("STATUS_KEY"))))
+        try:
+            payload = BOT.snapshot(bot_running(), bool(os.environ.get("STATUS_KEY")))
+        except Exception as e:
+            log(f"snapshot error: {e}")
+            payload = {
+                "bot_running": bot_running(),
+                "connected": False,
+                "stopped": True,
+                "last_error": f"snapshot error: {e}",
+                "events": [{"t": time.time(), "level": "error", "msg": f"snapshot error: {e}"}],
+                "trades": [],
+                "scanner": [],
+                "strategies": [],
+                "stats": {"trades": 0, "wins": 0, "losses": 0, "win_rate": None, "net": 0},
+                "limits": {"max_trades": MAX_TRADES, "stop_loss": STOP_LOSS,
+                           "take_profit": TAKE_PROFIT, "stake": STAKE},
+                "account": dict(ACCOUNT),
+                "balance": None,
+                "session_pl": None,
+                "currency": "USD",
+                "protected": bool(os.environ.get("STATUS_KEY")),
+                "trading_enabled": TRADING_ENABLED,
+                "paused": False,
+                "force_armed": False,
+                "force": {"symbol": None, "strategy": None, "skip_filter": False},
+                "auto_restart": AUTO_RESTART_AFTER_SL_TP,
+                "restart_in": None,
+                "stop_reason": None,
+                "balance_history": [],
+                "filter": {"window": DIGIT_WINDOW, "min_ticks": MIN_TICKS_FOR_FILTER},
+                "session_count": 0,
+            }
+        resp = jsonify(payload)
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
