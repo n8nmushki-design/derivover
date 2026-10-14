@@ -259,6 +259,9 @@ class Bot:
         self.stop_reason     = None
         self.restart_at      = None                  # when AUTO_RESTART: resume after this time
         self.session_count   = 0                     # how many sessions started this process
+        self.paused          = False                 # dashboard Pause: skip new entries
+        self.manual_symbol   = None                  # optional one-shot force symbol
+        self.manual_strategy = None                  # "over" | "under" | None (auto)
 
     # ---------- dashboard helpers ----------
     def note(self, level: str, msg: str):
@@ -275,6 +278,7 @@ class Bot:
                 return
             self.stop = True
             self.stop_reason = reason
+            self.paused = False
             if msg:
                 print(msg)
                 self.note(level, msg)
@@ -284,6 +288,79 @@ class Bot:
                 self.note("info",
                           f"Auto-restart in {RESTART_DELAY_SECS}s "
                           f"(new session after {reason.replace('_', '-')}).")
+
+    def set_paused(self, paused: bool):
+        with self.lock:
+            if self.stop:
+                return False
+            self.paused = bool(paused)
+            self.note("info", "Paused – no new trades." if self.paused
+                              else "Resumed – scanning for entries.")
+            return True
+
+    def force_next(self, symbol: str | None = None, strategy: str | None = None,
+                   skip_filter: bool = False):
+        """Clear cooldown and optionally prefer a symbol/strategy for the next entry.
+        skip_filter=True (manual trade) places the next contract even if digit filter fails."""
+        with self.lock:
+            self.last_trade_ts = 0.0
+            self.manual_symbol = symbol or None
+            self.manual_strategy = strategy if strategy in STRATEGIES else None
+            self.manual_skip_filter = bool(skip_filter)
+            parts = []
+            if symbol: parts.append(str(symbol))
+            if strategy: parts.append(str(strategy))
+            if skip_filter: parts.append("skip-filter")
+            self.note("info", "Force trigger – cooldown cleared"
+                      + (f" ({', '.join(parts)})" if parts else "."))
+            return True
+
+    def control(self, action: str, **kwargs) -> dict:
+        """Dashboard control actions. Returns {ok, message}."""
+        action = (action or "").strip().lower()
+        if action == "pause":
+            ok = self.set_paused(True)
+            return {"ok": ok, "message": "Paused" if ok else "Cannot pause while stopped"}
+        if action == "resume":
+            if self.stop and self.restart_at:
+                # Cancel scheduled wait and restart session now
+                self.reset_session()
+                return {"ok": True, "message": "Session restarted"}
+            if self.stop:
+                self.stop = False
+                self.stop_reason = None
+                self.restart_at = None
+                self.paused = False
+                self.note("info", "Resumed after stop.")
+                return {"ok": True, "message": "Resumed"}
+            ok = self.set_paused(False)
+            return {"ok": ok, "message": "Resumed"}
+        if action == "stop":
+            self.request_stop("user", "Stopped from dashboard.")
+            return {"ok": True, "message": "Stopped"}
+        if action == "reset_stats":
+            with self.lock:
+                self.trade_log.clear()
+                self.trades = 0
+                if self.balance is not None:
+                    self.start_balance = self.balance
+                self.note("info", "Stats reset from dashboard.")
+            return {"ok": True, "message": "Stats reset"}
+        if action == "force":
+            skip = bool(kwargs.get("skip_filter") or kwargs.get("skipFilter"))
+            self.force_next(kwargs.get("symbol"), kwargs.get("strategy"), skip_filter=skip)
+            if self.paused:
+                self.set_paused(False)
+            return {"ok": True, "message": "Manual trade armed" if skip else "Force trigger armed"}
+        if action == "manual":
+            self.force_next(kwargs.get("symbol"), kwargs.get("strategy"), skip_filter=True)
+            if self.paused:
+                self.set_paused(False)
+            return {"ok": True, "message": "Manual trade armed"}
+        if action == "reset_session":
+            self.reset_session()
+            return {"ok": True, "message": "Session reset"}
+        return {"ok": False, "message": f"Unknown action: {action}"}
 
     def reset_session(self):
         """Clear session P/L, barrier ladders and counters so a new run can start.
@@ -357,6 +434,13 @@ class Bot:
                 "bot_running": running,
                 "connected": self.connected,
                 "stopped": self.stop,
+                "paused": self.paused,
+                "force_armed": bool(self.manual_symbol or self.manual_strategy or self.manual_skip_filter),
+                "force": {
+                    "symbol": self.manual_symbol,
+                    "strategy": self.manual_strategy,
+                    "skip_filter": self.manual_skip_filter,
+                },
                 "stop_reason": self.stop_reason,
                 "restart_in": restart_in,
                 "auto_restart": AUTO_RESTART_AFTER_SL_TP,
@@ -449,13 +533,27 @@ class Bot:
 
     def can_trade(self, symbol: str) -> str | None:
         """Return the strategy to trade on this market now, or None."""
-        if self.stop or self.pending or self.open_contract:
+        if self.stop or self.paused or self.pending or self.open_contract:
+            return None
+        if self.manual_symbol and symbol != self.manual_symbol:
             return None
         if time.time() - self.last_trade_ts < COOLDOWN_SECONDS:
             return None
         if self.trades >= MAX_TRADES:
             self.request_stop("max_trades",
                               f"Trade limit of {MAX_TRADES} reached – stopping.")
+            return None
+        if self.manual_strategy:
+            key = self.manual_strategy
+            if self.manual_skip_filter or self.is_eligible(symbol, key):
+                return key
+            return None
+        if self.manual_symbol:
+            key = self.pick_strategy(symbol)
+            if key:
+                return key
+            if self.manual_skip_filter:
+                return "over"
             return None
         return self.pick_strategy(symbol)
 
@@ -481,6 +579,9 @@ class Bot:
         self.pending_since = time.time()
         self.pending_trade = {"symbol": symbol, "contract_type": ctype,
                               "barrier": int(barrier), "strategy": key}
+        self.manual_symbol = None
+        self.manual_strategy = None
+        self.manual_skip_filter = False
         # Buy with parameters directly (buy: 1). Avoids the short-lived
         # proposal-id race that causes "Unknown contract proposal" on 1-tick
         # digit contracts.
@@ -992,6 +1093,27 @@ else:
         resp = jsonify(BOT.snapshot(bot_running(), bool(os.environ.get("STATUS_KEY"))))
         resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    @app.route("/api/control", methods=["POST"])
+    def api_control():
+        """Dashboard auto-trade controls: pause, resume, stop, force, reset_stats, reset_session."""
+        if not key_ok():
+            return jsonify(error="forbidden"), 403
+        data = request.get_json(silent=True) or {}
+        # Also accept form fields
+        action = (data.get("action") or request.form.get("action") or "").strip().lower()
+        symbol = data.get("symbol") or request.form.get("symbol")
+        strategy = data.get("strategy") or request.form.get("strategy")
+        skip_filter = data.get("skip_filter", data.get("skipFilter",
+                      request.form.get("skip_filter")))
+        if isinstance(skip_filter, str):
+            skip_filter = skip_filter.strip().lower() in ("1", "true", "yes", "on")
+        result = BOT.control(action, symbol=symbol, strategy=strategy,
+                             skip_filter=bool(skip_filter))
+        status = 200 if result.get("ok") else 400
+        resp = jsonify(result)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, status
 
     # Under gunicorn the module is imported, not run as a script.
     if __name__ != "__main__" and os.environ.get("DERIV_AUTOSTART", "1") == "1":
