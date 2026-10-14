@@ -403,7 +403,9 @@ function renderAlerts(){
   else if(!S){if(failures>2)out+=alertHtml("err","Cannot reach the bot","Check that the service is running.")}
   else{
     if(S.last_error)out+=alertHtml("err","Bot error",S.last_error);
-    if(!S.connected&&!S.stopped){var off=S.offline_secs!=null?(" Offline "+S.offline_secs+"s."):"";out+=alertHtml("warn","Not connected to Deriv","Balance and digits appear after the WebSocket connects."+off+" Tap Reconnect if this lasts more than 30s. Check Render env: DERIV_APP_ID, DERIV_TOKEN (trade scope), and demo vs real.");}
+    if(!S.bot_running){out+=alertHtml("err","Bot process not running","The trading thread is stopped. Tap Reconnect or Resume. If it keeps failing, check Render logs for login errors (DERIV_APP_ID / DERIV_TOKEN / ACCOUNT_TYPE).");}
+    else if(!S.connected&&!S.stopped){var off=S.offline_secs!=null?(" Offline "+S.offline_secs+"s."):"";out+=alertHtml("warn","Not connected to Deriv","Balance and digits appear after the WebSocket connects."+off+" Tap Reconnect if this lasts more than 30s. Open Logs for login steps. Check DERIV_APP_ID, DERIV_TOKEN (trade scope), ACCOUNT_TYPE=demo|real.");}
+    if(S.stats&&S.limits&&S.stats.trades>=S.limits.max_trades){out+=alertHtml("warn","Trade limit reached",S.stats.trades+" / "+S.limits.max_trades+" trades used. Tap Refresh limit or wait for auto-refresh ("+((S.limits.refresh_in!=null)?(Math.ceil(S.limits.refresh_in/60)+" min left"):"every 5 min")+").");}
     var r=S.stop_reason,autoHint=S.auto_restart?("Auto-restart in "+(S.restart_in!=null?S.restart_in+"s":"a moment")+"."):"Restart the process to trade again.";
     if(S.stopped){
       if(r==="stop_loss")out+=alertHtml("err","Stop-loss reached","Session loss "+money(S.session_pl||0),autoHint);
@@ -437,10 +439,42 @@ function renderBalance(){
   var pts=vals.map(function(v,i){return(i/(vals.length-1)*300).toFixed(1)+","+(50-(v-lo)/(hi-lo)*42).toFixed(1)});
   svg.innerHTML='<polyline points="'+pts.join(" ")+'" fill="none" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>';
 }
+function fmtRemain(sec){
+  sec=Math.max(0,Number(sec)||0);
+  var m=Math.floor(sec/60),s=sec%60;
+  return m+":"+String(s).padStart(2,"0");
+}
 function renderStats(){
   var st=S.stats,open=S.trades.filter(function(t){return t.status==="open"})[0];
-  var items=[{t:"Trades placed",v:st.trades+" / "+S.limits.max_trades,s:"Max allowed",c:""},{t:"Win rate",v:st.win_rate==null?"—":pct(st.win_rate),s:st.wins+"W / "+st.losses+"L",c:""},{t:"Contract yield",v:signed(st.net),s:"Stake "+money(S.limits.stake),c:sgnClass(st.net)},{t:"Active position",v:open?"#"+open.n+" "+open.symbol:"None",s:open?((open.contract_type==="DIGITOVER"?"Over ":"Under ")+open.barrier):"Scanning",c:""}];
-  $("stats").innerHTML=items.map(function(it){return'<div class="rounded-xl bg-surface-container border border-outline-variant/20 p-3 lg:p-4"><div class="text-[10px] font-mono uppercase text-on-surface-variant mb-1">'+esc(it.t)+'</div><div class="text-lg font-semibold '+it.c+'">'+esc(it.v)+'</div><div class="text-[11px] text-on-surface-variant mt-0.5">'+esc(it.s)+"</div></div>"}).join("");
+  var lim=S.limits||{};
+  var used=st.trades!=null?st.trades:0;
+  var max=lim.max_trades!=null?lim.max_trades:50;
+  var atLimit=used>=max;
+  var refreshIn=lim.refresh_in!=null?lim.refresh_in:null;
+  var tradesCard=
+    '<div class="rounded-xl bg-surface-container border border-outline-variant/20 p-3 lg:p-4">'+
+      '<div class="flex items-center justify-between mb-1 gap-2">'+
+        '<div class="text-[10px] font-mono uppercase text-on-surface-variant">Trades placed</div>'+
+        '<button type="button" data-action="refresh_limit" class="ctrl-btn flex items-center gap-1 px-2 py-0.5 rounded-full border border-primary/40 text-primary text-[10px] font-semibold hover:bg-primary/10" title="Reset trade counter to 0 / '+max+'">'+
+          '<span class="material-symbols-outlined text-[14px]">refresh</span> Refresh limit'+
+        '</button>'+
+      '</div>'+
+      '<div class="text-lg font-semibold '+(atLimit?"text-primary":"")+'">'+used+" / "+max+'</div>'+
+      '<div class="text-[11px] text-on-surface-variant mt-0.5">'+
+        (atLimit?"Limit reached · ":"Max allowed · ")+
+        (refreshIn!=null?("auto refresh in "+fmtRemain(refreshIn)):"auto every 5 min")+
+      '</div>'+
+    '</div>';
+  var items=[
+    {html:tradesCard},
+    {t:"Win rate",v:st.win_rate==null?"—":pct(st.win_rate),s:st.wins+"W / "+st.losses+"L",c:""},
+    {t:"Contract yield",v:signed(st.net),s:"Stake "+money(S.limits.stake),c:sgnClass(st.net)},
+    {t:"Active position",v:open?"#"+open.n+" "+open.symbol:"None",s:open?((open.contract_type==="DIGITOVER"?"Over ":"Under ")+open.barrier):"Scanning",c:""}
+  ];
+  $("stats").innerHTML=items.map(function(it){
+    if(it.html)return it.html;
+    return'<div class="rounded-xl bg-surface-container border border-outline-variant/20 p-3 lg:p-4"><div class="text-[10px] font-mono uppercase text-on-surface-variant mb-1">'+esc(it.t)+'</div><div class="text-lg font-semibold '+it.c+'">'+esc(it.v)+'</div><div class="text-[11px] text-on-surface-variant mt-0.5">'+esc(it.s)+"</div></div>";
+  }).join("");
 }
 function digitCells(digits,n){return digits.slice(-n).map(function(d,i,a){var c=d<=1?"low":d>=8?"high":"mid";return'<span class="digit '+c+(i===a.length-1?" now":"")+'">'+d+"</span>"}).join("")}
 function marketRow(m,compact){

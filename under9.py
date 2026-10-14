@@ -62,6 +62,7 @@ STAKE             = 1.0
 DURATION_TICKS    = 1
 COOLDOWN_SECONDS  = 3
 MAX_TRADES        = 50
+TRADE_LIMIT_REFRESH_SECS = 300   # auto-reset trade counter every 5 minutes
 STOP_LOSS         = 3.0
 TAKE_PROFIT       = 7.5
 
@@ -297,6 +298,8 @@ class Bot:
         self.manual_symbol   = None                  # optional one-shot force symbol
         self.manual_strategy = None                  # "over" | "under" | None (auto)
         self.manual_skip_filter = False              # manual trade: ignore digit filter once
+        self.trades_window_started = time.time()     # when current trade-limit window began
+        self.limit_refresh_count = 0                 # how many times limit was refreshed
 
     # ---------- dashboard helpers ----------
 
@@ -306,6 +309,8 @@ class Bot:
             "manual_symbol": None,
             "manual_strategy": None,
             "manual_skip_filter": False,
+            "trades_window_started": time.time(),
+            "limit_refresh_count": 0,
             "paused": False,
             "reconnect_requested": False,
             "last_connect_attempt": 0.0,
@@ -375,6 +380,45 @@ class Bot:
                       + (f" ({', '.join(parts)})" if parts else "."))
             return True
 
+
+    def refresh_trade_limit(self, reason: str = "manual") -> dict:
+        """Reset the session trade counter (MAX_TRADES window) without wiping history."""
+        with self.lock:
+            prev = self.trades
+            self.trades = 0
+            self.trades_window_started = time.time()
+            self.limit_refresh_count = getattr(self, "limit_refresh_count", 0) + 1
+            self._limit_warned = False
+            cleared_stop = False
+            if self.stop and self.stop_reason == "max_trades":
+                self.stop = False
+                self.stop_reason = None
+                self.restart_at = None
+                cleared_stop = True
+            self.note(
+                "info",
+                f"Trade limit refreshed ({reason}): {prev}/{MAX_TRADES} → 0/{MAX_TRADES}"
+                + (" · trading resumed" if cleared_stop else ""),
+            )
+            return {
+                "ok": True,
+                "message": f"Trade limit reset (was {prev}/{MAX_TRADES})",
+                "previous": prev,
+                "max_trades": MAX_TRADES,
+                "resumed": cleared_stop,
+            }
+
+    def maybe_auto_refresh_trade_limit(self) -> None:
+        """If the 5-minute window elapsed, reset the trade counter automatically."""
+        started = getattr(self, "trades_window_started", None) or 0.0
+        if started <= 0:
+            with self.lock:
+                self.trades_window_started = time.time()
+            return
+        if time.time() - started < TRADE_LIMIT_REFRESH_SECS:
+            return
+        self.refresh_trade_limit(reason="auto-5min")
+
     def control(self, action: str, **kwargs) -> dict:
         """Dashboard control actions. Returns {ok, message}."""
         self.ensure_attrs()
@@ -399,10 +443,13 @@ class Bot:
         if action == "stop":
             self.request_stop("user", "Stopped from dashboard.")
             return {"ok": True, "message": "Stopped"}
+        if action in ("refresh_limit", "reset_trades", "refresh_trades"):
+            return self.refresh_trade_limit(reason="dashboard")
         if action == "reset_stats":
             with self.lock:
                 self.trade_log.clear()
                 self.trades = 0
+                self.trades_window_started = time.time()
                 if self.balance is not None:
                     self.start_balance = self.balance
                 self.note("info", "Stats reset from dashboard.")
@@ -538,8 +585,15 @@ class Bot:
                 "balance": self.balance,
                 "session_pl": session_pl,
                 "balance_history": list(self.balance_history)[-120:],
-                "limits": {"max_trades": MAX_TRADES, "stop_loss": STOP_LOSS,
-                           "take_profit": TAKE_PROFIT, "stake": STAKE},
+                "limits": {
+                    "max_trades": MAX_TRADES,
+                    "stop_loss": STOP_LOSS,
+                    "take_profit": TAKE_PROFIT,
+                    "stake": STAKE,
+                    "refresh_secs": TRADE_LIMIT_REFRESH_SECS,
+                    "refresh_in": max(0, int(TRADE_LIMIT_REFRESH_SECS - (time.time() - (getattr(self, "trades_window_started", time.time()) or time.time())))),
+                    "limit_refresh_count": getattr(self, "limit_refresh_count", 0),
+                },
                 "stats": {"trades": self.trades, "wins": wins, "losses": losses,
                           "win_rate": (wins / len(closed)) if closed else None,
                           "net": round(net, 2)},
@@ -625,9 +679,13 @@ class Bot:
             return None
         if time.time() - self.last_trade_ts < COOLDOWN_SECONDS:
             return None
+        # Auto-refresh trade window every TRADE_LIMIT_REFRESH_SECS (default 5 min)
+        self.maybe_auto_refresh_trade_limit()
         if self.trades >= MAX_TRADES:
-            self.request_stop("max_trades",
-                              f"Trade limit of {MAX_TRADES} reached – stopping.")
+            # Soft block – do not kill the bot thread; wait for refresh button / auto timer
+            if not getattr(self, "_limit_warned", False):
+                self.note("warn", f"Trade limit {MAX_TRADES} reached – waiting for refresh (auto every {TRADE_LIMIT_REFRESH_SECS // 60} min)")
+                self._limit_warned = True
             return None
         if self.manual_strategy:
             key = self.manual_strategy
@@ -946,6 +1004,7 @@ def run_session(bot: Bot):
     try:
         while True:
             now = time.time()
+            bot.maybe_auto_refresh_trade_limit()
             if bot.reconnect_requested:
                 bot.note("info", "Closing socket for reconnect")
                 break
@@ -1145,9 +1204,15 @@ def ensure_bot() -> None:
                     except Exception:
                         pass
         return
-    # Permanent stop and the thread has already exited — do not resurrect.
-    if BOT.stop and not (BOT.restart_at and AUTO_RESTART_AFTER_SL_TP):
+    # Permanent stops that should not auto-resurrect without user action.
+    if BOT.stop and BOT.stop_reason in ("login", "user"):
         return
+    # SL/TP wait is handled inside a living thread; if thread is dead, start fresh.
+    if BOT.stop and BOT.stop_reason == "max_trades":
+        # Soft-limit era: clear and restart so auto-refresh can run
+        BOT.stop = False
+        BOT.stop_reason = None
+        BOT.restart_at = None
     start_background_bot()
 
 # gunicorn --preload (or any os.fork) would copy the bot into the worker while
@@ -1289,8 +1354,8 @@ else:
             skip_filter = skip_filter.strip().lower() in ("1", "true", "yes", "on")
         result = BOT.control(action, symbol=symbol, strategy=strategy,
                              skip_filter=bool(skip_filter))
-        if action in ("reconnect", "restart_bot"):
-            # If the bot thread exited (e.g. after login failure), start it again.
+        if action in ("reconnect", "restart_bot", "refresh_limit", "reset_trades", "refresh_trades", "resume"):
+            # If the bot thread exited, start it again so trading can continue.
             ensure_bot()
             if not bot_running():
                 start_background_bot()
