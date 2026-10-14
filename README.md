@@ -66,6 +66,30 @@ Free tier allows ~100k requests/day — a 5-minute ping is trivial.
 - Deriv App ID + `pat_…` token are required (new API). If login fails, the dashboard shows the error; common causes: wrong App ID, token missing trade scope, or no account of the configured type (`demo`/`real`).
 - Free hosting (Render free, etc.) is supported; pair it with the Cloudflare cron above.
 
+
+## Auto-trade controls (dashboard)
+
+The dashboard **Auto Trade** bar posts to `POST /api/control` (same `STATUS_KEY` as `/api/state` when set):
+
+| Action | Effect |
+|--------|--------|
+| **Stop** | Stops new trades (`stop_reason=user`). Use Resume to continue. |
+| **Pause** | Keeps scanning digits but does not open new trades. |
+| **Resume** | Clears pause, or restarts after SL/TP / stop. |
+| **Force Trigger** | Clears cooldown; next eligible market/strategy entry. |
+| **Manual Trade** | Pick market + strategy; optional skip digit filter (one-shot). |
+| **Reset Stats** | Clears trade counters and resets session P/L baseline to current balance. |
+
+Also in the UI (client-side): market filters (All / Active / 1s / R_), trade filters + search + CSV export, log export, and auto-scroll for events.
+
+
+Example:
+
+```bash
+curl -X POST "$URL/api/control" -H "Content-Type: application/json" \
+  -H "X-Status-Key: $STATUS_KEY" -d '{"action":"pause"}'
+```
+
 ## Safety
 
 - Credentials are read from the environment only. Never commit them.

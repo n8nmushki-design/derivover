@@ -55,7 +55,7 @@ from websocket import (
 APP_ID = os.environ.get("DERIV_APP_ID", "")
 TOKEN  = os.environ.get("DERIV_TOKEN", "")
 
-ACCOUNT_TYPE      = "demo"          # "demo" or "real"
+ACCOUNT_TYPE      = os.environ.get("ACCOUNT_TYPE", "demo").strip().lower() or "demo"  # "demo" or "real"
 TRADING_ENABLED   = True
 
 STAKE             = 1.0
@@ -111,11 +111,19 @@ TOKEN  = clean(TOKEN)
 class ConfigError(Exception):
     pass
 
+def log(msg: str) -> None:
+    """Print with flush so gunicorn/Render shows bot lines immediately."""
+    print(msg, flush=True)
+
 BASE = "https://api.derivws.com"
 UA   = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
         "Chrome/120.0 Mobile Safari/537.36")
 
-def rest(method: str, path: str):
+def rest(method: str, path: str, timeout: float = 15.0):
+    """Call Deriv REST API. Raises ConfigError for auth problems."""
+    if not APP_ID or not TOKEN:
+        raise ConfigError("Missing DERIV_APP_ID or DERIV_TOKEN environment variables")
+    log(f"REST {method} {path} (app_id={APP_ID[:4]}… token={TOKEN[:6]}…)")
     req = urllib.request.Request(
         BASE + path,
         method=method,
@@ -129,14 +137,21 @@ def rest(method: str, path: str):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read().decode())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode()
+            data = json.loads(raw) if raw else {}
+            log(f"REST {method} {path} -> ok ({len(raw)} bytes)")
+            return data
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:400]
         msg  = f"HTTP {e.code} on {path}: {body}"
+        log(msg)
         if e.code in (400, 401, 403):
-            raise ConfigError(msg + "\nCheck APP_ID / TOKEN (trade scope required).")
+            raise ConfigError(msg + " — check DERIV_APP_ID / DERIV_TOKEN (trade scope required).")
         raise RuntimeError(msg)
+    except Exception as e:
+        log(f"REST {method} {path} failed: {type(e).__name__}: {e}")
+        raise RuntimeError(f"REST {method} {path} failed: {e}")
 
 def find_list(obj):
     if isinstance(obj, list) and obj:
@@ -199,7 +214,16 @@ def account_kind(a: dict):
         return "real"
     return None
 
+def _bot_note(level: str, msg: str) -> None:
+    """Best-effort dashboard note during login (BOT may not exist yet)."""
+    try:
+        BOT.note(level, msg)
+    except Exception:
+        log(f"{level}: {msg}")
+
+
 def get_ws_url() -> str:
+    _bot_note("info", f"Fetching accounts (type={ACCOUNT_TYPE})…")
     data = rest("GET", "/trading/v1/options/accounts")
     accounts = [a for a in find_list(data) if isinstance(a, dict)]
     if not accounts:
@@ -210,18 +234,24 @@ def get_ws_url() -> str:
     if chosen is None:
         found = ", ".join(f"{account_id_of(a) or '?'}={account_kind(a) or 'unknown'}"
                           for a in accounts)
-        raise ConfigError(f"No '{ACCOUNT_TYPE}' account found (accounts: {found})")
+        raise ConfigError(
+            f"No '{ACCOUNT_TYPE}' account found (accounts: {found}). "
+            f"Set ACCOUNT_TYPE in under9.py to match your token, or use a {ACCOUNT_TYPE} token."
+        )
 
     account_id = account_id_of(chosen)
     if not account_id:
         raise RuntimeError("Could not find account id: " + json.dumps(chosen)[:300])
 
     ACCOUNT.update(id=account_id, type=ACCOUNT_TYPE)
-    print("Using account:", account_id, f"({ACCOUNT_TYPE})")
+    log(f"Using account: {account_id} ({ACCOUNT_TYPE})")
+    _bot_note("info", f"Using account {account_id} ({ACCOUNT_TYPE})")
+    _bot_note("info", "Requesting WebSocket OTP…")
     otp = rest("POST", f"/trading/v1/options/accounts/{account_id}/otp")
     url = find_wss(otp)
     if not url:
         raise RuntimeError("No WebSocket URL in OTP response: " + json.dumps(otp)[:300])
+    _bot_note("info", "OTP received — opening WebSocket")
     return url
 
 def decimals_needed(price) -> int:
@@ -259,8 +289,41 @@ class Bot:
         self.stop_reason     = None
         self.restart_at      = None                  # when AUTO_RESTART: resume after this time
         self.session_count   = 0                     # how many sessions started this process
+        self.paused          = False                 # dashboard Pause: skip new entries
+        self.reconnect_requested = False
+        self.last_connect_attempt = 0.0
+        self.thread_started_at = 0.0
+        self._ws             = None
+        self.manual_symbol   = None                  # optional one-shot force symbol
+        self.manual_strategy = None                  # "over" | "under" | None (auto)
+        self.manual_skip_filter = False              # manual trade: ignore digit filter once
 
     # ---------- dashboard helpers ----------
+
+    def ensure_attrs(self):
+        """Fill any attributes added in newer deploys (avoids AttributeError on hot reload)."""
+        defaults = {
+            "manual_symbol": None,
+            "manual_strategy": None,
+            "manual_skip_filter": False,
+            "paused": False,
+            "reconnect_requested": False,
+            "last_connect_attempt": 0.0,
+            "thread_started_at": 0.0,
+            "_ws": None,
+            "pending_trade": None,
+            "pending_since": 0.0,
+            "open_since": 0.0,
+            "stop_reason": None,
+            "restart_at": None,
+            "session_count": 0,
+            "last_error": None,
+            "currency": "USD",
+        }
+        for k, v in defaults.items():
+            if not hasattr(self, k):
+                setattr(self, k, v)
+
     def note(self, level: str, msg: str):
         """Add a line to the event list shown on the dashboard."""
         with self.lock:
@@ -275,6 +338,7 @@ class Bot:
                 return
             self.stop = True
             self.stop_reason = reason
+            self.paused = False
             if msg:
                 print(msg)
                 self.note(level, msg)
@@ -284,6 +348,96 @@ class Bot:
                 self.note("info",
                           f"Auto-restart in {RESTART_DELAY_SECS}s "
                           f"(new session after {reason.replace('_', '-')}).")
+
+    def set_paused(self, paused: bool):
+        with self.lock:
+            if self.stop:
+                return False
+            self.paused = bool(paused)
+            self.note("info", "Paused – no new trades." if self.paused
+                              else "Resumed – scanning for entries.")
+            return True
+
+    def force_next(self, symbol: str | None = None, strategy: str | None = None,
+                   skip_filter: bool = False):
+        """Clear cooldown and optionally prefer a symbol/strategy for the next entry.
+        skip_filter=True (manual trade) places the next contract even if digit filter fails."""
+        with self.lock:
+            self.last_trade_ts = 0.0
+            self.manual_symbol = symbol or None
+            self.manual_strategy = strategy if strategy in STRATEGIES else None
+            self.manual_skip_filter = bool(skip_filter)
+            parts = []
+            if symbol: parts.append(str(symbol))
+            if strategy: parts.append(str(strategy))
+            if skip_filter: parts.append("skip-filter")
+            self.note("info", "Force trigger – cooldown cleared"
+                      + (f" ({', '.join(parts)})" if parts else "."))
+            return True
+
+    def control(self, action: str, **kwargs) -> dict:
+        """Dashboard control actions. Returns {ok, message}."""
+        self.ensure_attrs()
+        action = (action or "").strip().lower()
+        if action == "pause":
+            ok = self.set_paused(True)
+            return {"ok": ok, "message": "Paused" if ok else "Cannot pause while stopped"}
+        if action == "resume":
+            if self.stop and self.restart_at:
+                # Cancel scheduled wait and restart session now
+                self.reset_session()
+                return {"ok": True, "message": "Session restarted"}
+            if self.stop:
+                self.stop = False
+                self.stop_reason = None
+                self.restart_at = None
+                self.paused = False
+                self.note("info", "Resumed after stop.")
+                return {"ok": True, "message": "Resumed"}
+            ok = self.set_paused(False)
+            return {"ok": ok, "message": "Resumed"}
+        if action == "stop":
+            self.request_stop("user", "Stopped from dashboard.")
+            return {"ok": True, "message": "Stopped"}
+        if action == "reset_stats":
+            with self.lock:
+                self.trade_log.clear()
+                self.trades = 0
+                if self.balance is not None:
+                    self.start_balance = self.balance
+                self.note("info", "Stats reset from dashboard.")
+            return {"ok": True, "message": "Stats reset"}
+        if action == "force":
+            skip = bool(kwargs.get("skip_filter") or kwargs.get("skipFilter"))
+            self.force_next(kwargs.get("symbol"), kwargs.get("strategy"), skip_filter=skip)
+            if self.paused:
+                self.set_paused(False)
+            return {"ok": True, "message": "Manual trade armed" if skip else "Force trigger armed"}
+        if action == "manual":
+            self.force_next(kwargs.get("symbol"), kwargs.get("strategy"), skip_filter=True)
+            if self.paused:
+                self.set_paused(False)
+            return {"ok": True, "message": "Manual trade armed"}
+        if action in ("reconnect", "restart_bot"):
+            self.reconnect_requested = True
+            self.last_error = None
+            # Clear permanent stop so run_forever can start a new session
+            if self.stop and self.stop_reason in ("login", "user", "max_trades", None):
+                self.stop = False
+                self.stop_reason = None
+                self.restart_at = None
+            self.note("info", "Reconnect requested from dashboard")
+            ws = self._ws
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            return {"ok": True, "message": "Reconnecting to Deriv…"}
+        if action == "reset_session":
+            self.reset_session()
+            return {"ok": True, "message": "Session reset"}
+        return {"ok": False, "message": f"Unknown action: {action}"}
 
     def reset_session(self):
         """Clear session P/L, barrier ladders and counters so a new run can start.
@@ -310,6 +464,7 @@ class Bot:
 
     def snapshot(self, running: bool, protected: bool) -> dict:
         """Everything the dashboard shows, as plain JSON-safe data."""
+        self.ensure_attrs()
         with self.lock:
             closed = [r for r in self.trade_log if r["status"] != "open"]
             wins   = sum(1 for r in closed if r["status"] == "won")
@@ -356,7 +511,21 @@ class Bot:
             return {
                 "bot_running": running,
                 "connected": self.connected,
+                "offline_secs": (None if self.connected else (
+                    round(time.time() - self.last_connect_attempt)
+                    if self.last_connect_attempt else (
+                        round(time.time() - self.thread_started_at)
+                        if self.thread_started_at else None))),
                 "stopped": self.stop,
+                "paused": self.paused,
+                "force_armed": bool(getattr(self, "manual_symbol", None)
+                                     or getattr(self, "manual_strategy", None)
+                                     or getattr(self, "manual_skip_filter", False)),
+                "force": {
+                    "symbol": getattr(self, "manual_symbol", None),
+                    "strategy": getattr(self, "manual_strategy", None),
+                    "skip_filter": bool(getattr(self, "manual_skip_filter", False)),
+                },
                 "stop_reason": self.stop_reason,
                 "restart_in": restart_in,
                 "auto_restart": AUTO_RESTART_AFTER_SL_TP,
@@ -449,13 +618,28 @@ class Bot:
 
     def can_trade(self, symbol: str) -> str | None:
         """Return the strategy to trade on this market now, or None."""
-        if self.stop or self.pending or self.open_contract:
+        self.ensure_attrs()
+        if self.stop or self.paused or self.pending or self.open_contract:
+            return None
+        if self.manual_symbol and symbol != self.manual_symbol:
             return None
         if time.time() - self.last_trade_ts < COOLDOWN_SECONDS:
             return None
         if self.trades >= MAX_TRADES:
             self.request_stop("max_trades",
                               f"Trade limit of {MAX_TRADES} reached – stopping.")
+            return None
+        if self.manual_strategy:
+            key = self.manual_strategy
+            if getattr(self, 'manual_skip_filter', False) or self.is_eligible(symbol, key):
+                return key
+            return None
+        if self.manual_symbol:
+            key = self.pick_strategy(symbol)
+            if key:
+                return key
+            if getattr(self, 'manual_skip_filter', False):
+                return "over"
             return None
         return self.pick_strategy(symbol)
 
@@ -481,6 +665,9 @@ class Bot:
         self.pending_since = time.time()
         self.pending_trade = {"symbol": symbol, "contract_type": ctype,
                               "barrier": int(barrier), "strategy": key}
+        self.manual_symbol = None
+        self.manual_strategy = None
+        self.manual_skip_filter = False
         # Buy with parameters directly (buy: 1). Avoids the short-lived
         # proposal-id race that causes "Unknown contract proposal" on 1-tick
         # digit contracts.
@@ -697,11 +884,35 @@ class Bot:
                 self._unknown = getattr(self, "_unknown", 0) + 1
 
 def run_session(bot: Bot):
-    url = get_ws_url()
-    ws  = create_connection(url, timeout=15, header=["User-Agent: " + UA])
+    bot.note("info", "Connecting to Deriv…")
+    bot.last_connect_attempt = time.time()
+    bot.connected = False
+    ws = None
+    if not APP_ID or not TOKEN:
+        bot.last_error = "Missing DERIV_APP_ID or DERIV_TOKEN"
+        bot.note("error", bot.last_error)
+        raise ConfigError(bot.last_error)
+    bot.note("info", f"Credentials present (app_id={APP_ID[:4]}…, token={TOKEN[:6]}…)")
+    log("run_session: resolving account + OTP")
+    try:
+        url = get_ws_url()
+    except Exception as e:
+        bot.last_error = f"Login / account: {e}"
+        bot.note("error", bot.last_error[:300])
+        raise
+    bot.note("info", f"Opening WebSocket (account {ACCOUNT.get('id') or '?'})")
+    try:
+        ws = create_connection(url, timeout=20, header=["User-Agent: " + UA])
+    except Exception as e:
+        bot.last_error = f"WebSocket connect failed: {e}"
+        bot.note("error", bot.last_error)
+        raise
     ws.settimeout(10)
+    bot._ws = ws
+    bot.reconnect_requested = False
     print("Connected.")
     bot.connected = True
+    bot.last_error = None
     bot.note("info", f"Connected to Deriv ({ACCOUNT['type']} account {ACCOUNT['id']})")
     with bot.lock:
         bot.pending = False            # an unanswered proposal died with the old connection
@@ -735,6 +946,9 @@ def run_session(bot: Bot):
     try:
         while True:
             now = time.time()
+            if bot.reconnect_requested:
+                bot.note("info", "Closing socket for reconnect")
+                break
             if bot.stop:
                 # Let an open trade finish so its result is recorded.
                 stop_seen = stop_seen or now
@@ -756,14 +970,19 @@ def run_session(bot: Bot):
                 bot.handle(ws, json.loads(raw))
     finally:
         bot.connected = False
-        try:
-            ws.close()
-        except Exception:
-            pass
+        bot._ws = None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
 def run_forever(bot: Bot):
     """Run sessions with auto-reconnect. On SL/TP, optionally restart a new session."""
     delay = 3
+    bot.thread_started_at = time.time()
+    log("Bot thread entered run_forever")
+    bot.note("info", "Bot thread started")
 
     while True:
         # Wait out a scheduled auto-restart (SL/TP) then reset session counters.
@@ -801,10 +1020,19 @@ def run_forever(bot: Bot):
             print(bot.last_error)
             bot.note("error", bot.last_error)
 
+        if bot.reconnect_requested:
+            bot.reconnect_requested = False
+            bot.connected = False
+            bot.note("info", "Reconnecting now…")
+            delay = 1
+            time.sleep(0.5)
+            continue
+
         if bot.stop and not (bot.restart_at and AUTO_RESTART_AFTER_SL_TP):
             break
         if bot.stop:
             continue
+        bot.note("warn", f"Reconnecting in {delay}s…")
         print(f"Reconnecting in {delay}s …\n")
         time.sleep(delay)
         delay = min(delay * 2, 60)
@@ -866,9 +1094,11 @@ def start_background_bot() -> bool:
             msg = "Missing DERIV_APP_ID or DERIV_TOKEN"
             if BOT.last_error != msg:         # report once, not on every request
                 BOT.last_error = msg
-                print(msg)
+                log(msg)
                 BOT.note("error", msg)
             return False
+        log(f"Starting bot thread (APP_ID set={bool(APP_ID)}, TOKEN set={bool(TOKEN)}, "
+            f"TOKEN prefix={(TOKEN[:6]+'…') if len(TOKEN)>=6 else '?'}, account_type={ACCOUNT_TYPE})")
         if _thread is not None and mine:
             BOT.note("warn", "The bot thread had stopped, starting it again")
         # Fresh process / crashed thread: clear any leftover permanent stop.
@@ -899,8 +1129,21 @@ def ensure_bot() -> None:
     (login, max trades, user) stay stopped."""
     if os.environ.get("DERIV_AUTOSTART", "1") != "1":
         return
-    # Thread still alive (including waiting for auto-restart) — nothing to do.
+    # Thread still alive (including waiting for auto-restart).
     if _thread and _thread.is_alive() and _owner_pid == os.getpid():
+        # Stuck offline: never connected or disconnected for too long → nudge reconnect.
+        if (not BOT.stop and not BOT.connected and not BOT.reconnect_requested):
+            ref = BOT.last_connect_attempt or BOT.thread_started_at
+            if ref and (time.time() - ref) > 90:
+                log("ensure_bot: offline >90s — requesting reconnect")
+                BOT.reconnect_requested = True
+                BOT.note("warn", "Still offline after 90s — retrying Deriv connection")
+                ws = BOT._ws
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
         return
     # Permanent stop and the thread has already exited — do not resurrect.
     if BOT.stop and not (BOT.restart_at and AUTO_RESTART_AFTER_SL_TP):
@@ -989,9 +1232,67 @@ else:
     def api_state():
         if not key_ok():
             return jsonify(error="forbidden"), 403
-        resp = jsonify(BOT.snapshot(bot_running(), bool(os.environ.get("STATUS_KEY"))))
+        try:
+            payload = BOT.snapshot(bot_running(), bool(os.environ.get("STATUS_KEY")))
+        except Exception as e:
+            log(f"snapshot error: {e}")
+            payload = {
+                "bot_running": bot_running(),
+                "connected": False,
+                "stopped": True,
+                "last_error": f"snapshot error: {e}",
+                "events": [{"t": time.time(), "level": "error", "msg": f"snapshot error: {e}"}],
+                "trades": [],
+                "scanner": [],
+                "strategies": [],
+                "stats": {"trades": 0, "wins": 0, "losses": 0, "win_rate": None, "net": 0},
+                "limits": {"max_trades": MAX_TRADES, "stop_loss": STOP_LOSS,
+                           "take_profit": TAKE_PROFIT, "stake": STAKE},
+                "account": dict(ACCOUNT),
+                "balance": None,
+                "session_pl": None,
+                "currency": "USD",
+                "protected": bool(os.environ.get("STATUS_KEY")),
+                "trading_enabled": TRADING_ENABLED,
+                "paused": False,
+                "force_armed": False,
+                "force": {"symbol": None, "strategy": None, "skip_filter": False},
+                "auto_restart": AUTO_RESTART_AFTER_SL_TP,
+                "restart_in": None,
+                "stop_reason": None,
+                "balance_history": [],
+                "filter": {"window": DIGIT_WINDOW, "min_ticks": MIN_TICKS_FOR_FILTER},
+                "session_count": 0,
+            }
+        resp = jsonify(payload)
         resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    @app.route("/api/control", methods=["POST"])
+    def api_control():
+        """Dashboard auto-trade controls: pause, resume, stop, force, reset_stats, reset_session."""
+        if not key_ok():
+            return jsonify(error="forbidden"), 403
+        data = request.get_json(silent=True) or {}
+        # Also accept form fields
+        action = (data.get("action") or request.form.get("action") or "").strip().lower()
+        symbol = data.get("symbol") or request.form.get("symbol")
+        strategy = data.get("strategy") or request.form.get("strategy")
+        skip_filter = data.get("skip_filter", data.get("skipFilter",
+                      request.form.get("skip_filter")))
+        if isinstance(skip_filter, str):
+            skip_filter = skip_filter.strip().lower() in ("1", "true", "yes", "on")
+        result = BOT.control(action, symbol=symbol, strategy=strategy,
+                             skip_filter=bool(skip_filter))
+        if action in ("reconnect", "restart_bot"):
+            # If the bot thread exited (e.g. after login failure), start it again.
+            ensure_bot()
+            if not bot_running():
+                start_background_bot()
+        status = 200 if result.get("ok") else 400
+        resp = jsonify(result)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, status
 
     # Under gunicorn the module is imported, not run as a script.
     if __name__ != "__main__" and os.environ.get("DERIV_AUTOSTART", "1") == "1":
