@@ -580,6 +580,11 @@ class Bot:
                 "last_error": self.last_error,
                 "protected": protected,
                 "trading_enabled": TRADING_ENABLED,
+                "supabase": {
+                    "enabled": bool(SUPA and getattr(SUPA, "enabled", False)),
+                    "session_id": getattr(SUPA, "current_session_id", None) if SUPA else None,
+                    "last_error": getattr(SUPA, "last_error", None) if SUPA else None,
+                },
                 "account": dict(ACCOUNT),
                 "currency": self.currency,
                 "balance": self.balance,
@@ -833,6 +838,13 @@ class Bot:
             if self.start_balance is None:
                 self.start_balance = self.balance
                 print(f"Starting balance: {self.balance:.2f} {self.currency}")
+                if self.session_count == 0:
+                    self.session_count = 1
+                try:
+                    if SUPA and not getattr(SUPA, "current_session_id", None):
+                        self._supa_start_session()
+                except Exception as e:
+                    print(f"[supabase] first session: {e}", flush=True)
 
             profit = self.balance - self.start_balance
             print(f"BALANCE: {self.balance:.2f} {self.currency}  (P/L {profit:+.2f})")
@@ -922,6 +934,15 @@ class Bot:
                 rec["profit"]  = profit
                 rec["t_close"] = time.time()
                 self.note("info", f"Trade #{rec['n']} {rec['status']}: {profit:+.2f}")
+                try:
+                    if SUPA:
+                        SUPA.save_trade_close(
+                            rec,
+                            account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                        )
+                        self._supa_update_session()
+                except Exception as e:
+                    print(f"[supabase] save close trade: {e}", flush=True)
 
             # Only the strategy that placed this trade moves its own barrier ladder.
             key = (rec or {}).get("strategy") or self.open_strategy

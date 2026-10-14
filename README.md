@@ -90,6 +90,20 @@ curl -X POST "$URL/api/control" -H "Content-Type: application/json" \
   -H "X-Status-Key: $STATUS_KEY" -d '{"action":"pause"}'
 ```
 
+## Supabase (optional history)
+
+Persist sessions and trades (demo and real kept separate):
+
+1. Run [`supabase/schema.sql`](supabase/schema.sql) in the Supabase SQL Editor  
+2. Set on the host:
+
+```bash
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=eyJ...   # service_role only
+```
+
+See [`supabase/README.md`](supabase/README.md) for details.
+
 ## Safety
 
 - Credentials are read from the environment only. Never commit them.
