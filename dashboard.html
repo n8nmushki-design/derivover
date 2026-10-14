@@ -144,6 +144,18 @@ button:disabled{opacity:.45;cursor:not-allowed}
 <main class="min-h-screen">
 <div class="max-w-7xl mx-auto px-4 lg:px-6 py-4 lg:py-6 space-y-4">
 <div id="alerts" class="space-y-2"></div>
+    <div id="unlockPanel" class="hidden rounded-xl border border-primary/40 bg-primary/10 px-4 py-4 space-y-3">
+      <div>
+        <strong class="font-semibold text-sm">Dashboard key required</strong>
+        <p class="text-xs text-on-surface-variant mt-1">Enter the same <span class="font-mono">STATUS_KEY</span> you set on Render, then unlock.</p>
+      </div>
+      <form id="keyForm" class="flex flex-col sm:flex-row gap-2">
+        <input id="keyIn" type="password" name="status_key" autocomplete="current-password"
+          placeholder="STATUS_KEY" class="flex-1 min-w-[180px] px-3 py-2.5 rounded-lg bg-surface-container-low border border-outline-variant/40 text-sm text-on-surface"/>
+        <button type="submit" id="keyUnlockBtn" class="px-5 py-2.5 rounded-lg bg-primary-container text-on-primary text-sm font-semibold shrink-0">Unlock</button>
+      </form>
+      <p id="keyErr" class="text-xs text-error hidden"></p>
+    </div>
 
     <!-- Auto-trade controls -->
     <div id="controls" class="rounded-xl bg-surface-container border border-outline-variant/20 p-3 lg:p-4 flex flex-wrap items-center gap-2">
@@ -383,8 +395,10 @@ function renderHeader(){
 }
 function renderAge(){$("updated").textContent=lastOk?Math.max(0,Math.round((Date.now()-lastOk)/1000))+"s ago":"";$("uptime").textContent=fmtUptime()}
 function renderAlerts(){
+  var panel=$("unlockPanel");
+  if(panel)panel.classList.toggle("hidden",!needKey);
   var out="";
-  if(needKey){out+=alertHtml("warn","Dashboard key required","Enter the STATUS_KEY set on the server.");out+='<form id="keyForm" class="flex gap-2 flex-wrap mt-2"><input id="keyIn" type="password" placeholder="STATUS_KEY" class="flex-1 min-w-[180px] px-3 py-2 rounded-lg bg-surface-container-low border border-outline-variant/40 text-sm"/><button type="submit" class="px-4 py-2 rounded-lg bg-primary-container text-on-primary text-sm font-semibold">Unlock</button></form>'}
+  if(needKey){/* form lives in #unlockPanel – do not rebuild it here */}
   else if(!S){if(failures>2)out+=alertHtml("err","Cannot reach the bot","Check that the service is running.")}
   else{
     if(S.last_error)out+=alertHtml("err","Bot error",S.last_error);
@@ -402,8 +416,8 @@ function renderAlerts(){
     if(!S.protected)out+=alertHtml("warn","Public session","Use Hide balance or set STATUS_KEY.");
   }
   $("alerts").innerHTML=out;
-  var form=$("keyForm");if(form)form.addEventListener("submit",function(e){e.preventDefault();key=$("keyIn").value.trim();localStorage.setItem("derivover_key",key);needKey=false;tick()});
 }
+
 function renderBalance(){
   var cur=(S&&S.currency)||"USD";
   if(hideBal){$("bal").textContent="••••••";$("topBal").textContent="••••••";$("cur").textContent=""}
@@ -567,6 +581,9 @@ function sendControl(action, extra){
 document.addEventListener("click",function(e){
   var t=e.target;
   if(!t||!t.closest)return;
+
+  // Let STATUS_KEY form work normally
+  if(t.closest("#keyForm")||t.closest("#unlockPanel"))return;
 
   // Privacy toggle
   if(t.closest("#hideBalBtn")||t.closest("#eyeBtn")){
@@ -816,6 +833,38 @@ if(as){
   autoScrollLogs=as.checked;
   as.addEventListener("change",function(){autoScrollLogs=as.checked;if(S)renderEvents()});
 }
+
+
+/* ----- STATUS_KEY unlock (stable form, not rebuilt on poll) ----- */
+(function(){
+  var form=$("keyForm");
+  if(!form)return;
+  form.addEventListener("submit",function(e){
+    e.preventDefault();
+    e.stopPropagation();
+    var input=$("keyIn");
+    var err=$("keyErr");
+    var val=(input&&input.value?input.value:"").trim();
+    if(!val){
+      if(err){err.textContent="Enter your STATUS_KEY.";err.classList.remove("hidden");}
+      return;
+    }
+    key=val;
+    localStorage.setItem("derivover_key",key);
+    if(err){err.classList.add("hidden");err.textContent="";}
+    needKey=false;
+    var btn=$("keyUnlockBtn");
+    if(btn){btn.disabled=true;btn.textContent="Checking…";}
+    tick().then(function(){
+      if(btn){btn.disabled=false;btn.textContent="Unlock";}
+      if(needKey){
+        if(err){err.textContent="Key rejected. Check STATUS_KEY on Render (exact match, no extra spaces).";err.classList.remove("hidden");}
+      }else{
+        if(input)input.value="";
+      }
+    });
+  });
+})();
 
 function tick(){var headers=key?{"X-Status-Key":key}:{};return fetch("/api/state",{headers:headers,cache:"no-store"}).then(function(r){if(r.status===403){needKey=true;S=null;failures=0;render();return}if(!r.ok)throw new Error("HTTP "+r.status);return r.json().then(function(s){S=s;lastOk=Date.now();failures=0;needKey=false;render()})}).catch(function(){failures++;render()})}
 function loop(){tick().then(function(){setTimeout(loop,document.hidden?8000:2000)})}
