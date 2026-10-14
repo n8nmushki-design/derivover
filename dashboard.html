@@ -162,6 +162,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
         <button type="button" data-action="resume" id="btnResume" class="ctrl-btn flex items-center gap-1.5 px-3 py-2 rounded-lg bg-primary-container text-on-primary text-xs font-semibold hover:opacity-90 transition-opacity">
           <span class="material-symbols-outlined text-[16px]">play_circle</span> Resume
         </button>
+        <button type="button" data-action="reconnect" id="btnReconnect" class="ctrl-btn flex items-center gap-1.5 px-3 py-2 rounded-lg border border-primary/50 text-primary text-xs font-semibold hover:bg-primary/10 transition-colors">
+          <span class="material-symbols-outlined text-[16px]">wifi_protected_setup</span> Reconnect
+        </button>
         <button type="button" data-action="force" class="ctrl-btn flex items-center gap-1.5 px-3 py-2 rounded-lg border border-primary/50 text-primary text-xs font-semibold hover:bg-primary/10 transition-colors">
           <span class="material-symbols-outlined text-[16px]">bolt</span> Force Trigger
         </button>
@@ -385,6 +388,7 @@ function renderAlerts(){
   else if(!S){if(failures>2)out+=alertHtml("err","Cannot reach the bot","Check that the service is running.")}
   else{
     if(S.last_error)out+=alertHtml("err","Bot error",S.last_error);
+    if(!S.connected&&!S.stopped){var off=S.offline_secs!=null?(" Offline "+S.offline_secs+"s."):"";out+=alertHtml("warn","Not connected to Deriv","Balance and digits appear after the WebSocket connects."+off+" Tap Reconnect if this lasts more than 30s. Check Render env: DERIV_APP_ID, DERIV_TOKEN (trade scope), and demo vs real.");}
     var r=S.stop_reason,autoHint=S.auto_restart?("Auto-restart in "+(S.restart_in!=null?S.restart_in+"s":"a moment")+"."):"Restart the process to trade again.";
     if(S.stopped){
       if(r==="stop_loss")out+=alertHtml("err","Stop-loss reached","Session loss "+money(S.session_pl||0),autoHint);

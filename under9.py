@@ -111,11 +111,16 @@ TOKEN  = clean(TOKEN)
 class ConfigError(Exception):
     pass
 
+def log(msg: str) -> None:
+    """Print with flush so gunicorn/Render shows bot lines immediately."""
+    print(msg, flush=True)
+
 BASE = "https://api.derivws.com"
 UA   = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
         "Chrome/120.0 Mobile Safari/537.36")
 
 def rest(method: str, path: str):
+    log(f"REST {method} {path}")
     req = urllib.request.Request(
         BASE + path,
         method=method,
@@ -129,14 +134,20 @@ def rest(method: str, path: str):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read().decode())
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode())
+            log(f"REST {method} {path} -> ok")
+            return data
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:400]
         msg  = f"HTTP {e.code} on {path}: {body}"
+        log(msg)
         if e.code in (400, 401, 403):
             raise ConfigError(msg + "\nCheck APP_ID / TOKEN (trade scope required).")
         raise RuntimeError(msg)
+    except Exception as e:
+        log(f"REST {method} {path} failed: {e}")
+        raise
 
 def find_list(obj):
     if isinstance(obj, list) and obj:
@@ -260,6 +271,10 @@ class Bot:
         self.restart_at      = None                  # when AUTO_RESTART: resume after this time
         self.session_count   = 0                     # how many sessions started this process
         self.paused          = False                 # dashboard Pause: skip new entries
+        self.reconnect_requested = False
+        self.last_connect_attempt = 0.0
+        self.thread_started_at = 0.0
+        self._ws             = None
         self.manual_symbol   = None                  # optional one-shot force symbol
         self.manual_strategy = None                  # "over" | "under" | None (auto)
 
@@ -357,6 +372,22 @@ class Bot:
             if self.paused:
                 self.set_paused(False)
             return {"ok": True, "message": "Manual trade armed"}
+        if action in ("reconnect", "restart_bot"):
+            self.reconnect_requested = True
+            self.last_error = None
+            # Clear permanent stop so run_forever can start a new session
+            if self.stop and self.stop_reason in ("login", "user", "max_trades", None):
+                self.stop = False
+                self.stop_reason = None
+                self.restart_at = None
+            self.note("info", "Reconnect requested from dashboard")
+            ws = self._ws
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            return {"ok": True, "message": "Reconnecting to Deriv…"}
         if action == "reset_session":
             self.reset_session()
             return {"ok": True, "message": "Session reset"}
@@ -433,6 +464,11 @@ class Bot:
             return {
                 "bot_running": running,
                 "connected": self.connected,
+                "offline_secs": (None if self.connected else (
+                    round(time.time() - self.last_connect_attempt)
+                    if self.last_connect_attempt else (
+                        round(time.time() - self.thread_started_at)
+                        if self.thread_started_at else None))),
                 "stopped": self.stop,
                 "paused": self.paused,
                 "force_armed": bool(self.manual_symbol or self.manual_strategy or self.manual_skip_filter),
@@ -798,11 +834,30 @@ class Bot:
                 self._unknown = getattr(self, "_unknown", 0) + 1
 
 def run_session(bot: Bot):
-    url = get_ws_url()
-    ws  = create_connection(url, timeout=15, header=["User-Agent: " + UA])
+    bot.note("info", "Connecting to Deriv…")
+    bot.last_connect_attempt = time.time()
+    bot.connected = False
+    ws = None
+    log("run_session: resolving account + OTP")
+    try:
+        url = get_ws_url()
+    except Exception as e:
+        bot.last_error = f"Login / account: {e}"
+        bot.note("error", bot.last_error)
+        raise
+    bot.note("info", f"Opening WebSocket (account {ACCOUNT.get('id') or '?'})")
+    try:
+        ws = create_connection(url, timeout=20, header=["User-Agent: " + UA])
+    except Exception as e:
+        bot.last_error = f"WebSocket connect failed: {e}"
+        bot.note("error", bot.last_error)
+        raise
     ws.settimeout(10)
+    bot._ws = ws
+    bot.reconnect_requested = False
     print("Connected.")
     bot.connected = True
+    bot.last_error = None
     bot.note("info", f"Connected to Deriv ({ACCOUNT['type']} account {ACCOUNT['id']})")
     with bot.lock:
         bot.pending = False            # an unanswered proposal died with the old connection
@@ -836,6 +891,9 @@ def run_session(bot: Bot):
     try:
         while True:
             now = time.time()
+            if bot.reconnect_requested:
+                bot.note("info", "Closing socket for reconnect")
+                break
             if bot.stop:
                 # Let an open trade finish so its result is recorded.
                 stop_seen = stop_seen or now
@@ -857,14 +915,19 @@ def run_session(bot: Bot):
                 bot.handle(ws, json.loads(raw))
     finally:
         bot.connected = False
-        try:
-            ws.close()
-        except Exception:
-            pass
+        bot._ws = None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
 def run_forever(bot: Bot):
     """Run sessions with auto-reconnect. On SL/TP, optionally restart a new session."""
     delay = 3
+    bot.thread_started_at = time.time()
+    log("Bot thread entered run_forever")
+    bot.note("info", "Bot thread started")
 
     while True:
         # Wait out a scheduled auto-restart (SL/TP) then reset session counters.
@@ -902,10 +965,19 @@ def run_forever(bot: Bot):
             print(bot.last_error)
             bot.note("error", bot.last_error)
 
+        if bot.reconnect_requested:
+            bot.reconnect_requested = False
+            bot.connected = False
+            bot.note("info", "Reconnecting now…")
+            delay = 1
+            time.sleep(0.5)
+            continue
+
         if bot.stop and not (bot.restart_at and AUTO_RESTART_AFTER_SL_TP):
             break
         if bot.stop:
             continue
+        bot.note("warn", f"Reconnecting in {delay}s…")
         print(f"Reconnecting in {delay}s …\n")
         time.sleep(delay)
         delay = min(delay * 2, 60)
@@ -967,9 +1039,11 @@ def start_background_bot() -> bool:
             msg = "Missing DERIV_APP_ID or DERIV_TOKEN"
             if BOT.last_error != msg:         # report once, not on every request
                 BOT.last_error = msg
-                print(msg)
+                log(msg)
                 BOT.note("error", msg)
             return False
+        log(f"Starting bot thread (APP_ID set={bool(APP_ID)}, TOKEN set={bool(TOKEN)}, "
+            f"TOKEN prefix={(TOKEN[:6]+'…') if len(TOKEN)>=6 else '?'}, account_type={ACCOUNT_TYPE})")
         if _thread is not None and mine:
             BOT.note("warn", "The bot thread had stopped, starting it again")
         # Fresh process / crashed thread: clear any leftover permanent stop.
@@ -1000,8 +1074,21 @@ def ensure_bot() -> None:
     (login, max trades, user) stay stopped."""
     if os.environ.get("DERIV_AUTOSTART", "1") != "1":
         return
-    # Thread still alive (including waiting for auto-restart) — nothing to do.
+    # Thread still alive (including waiting for auto-restart).
     if _thread and _thread.is_alive() and _owner_pid == os.getpid():
+        # Stuck offline: never connected or disconnected for too long → nudge reconnect.
+        if (not BOT.stop and not BOT.connected and not BOT.reconnect_requested):
+            ref = BOT.last_connect_attempt or BOT.thread_started_at
+            if ref and (time.time() - ref) > 90:
+                log("ensure_bot: offline >90s — requesting reconnect")
+                BOT.reconnect_requested = True
+                BOT.note("warn", "Still offline after 90s — retrying Deriv connection")
+                ws = BOT._ws
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
         return
     # Permanent stop and the thread has already exited — do not resurrect.
     if BOT.stop and not (BOT.restart_at and AUTO_RESTART_AFTER_SL_TP):
@@ -1110,6 +1197,11 @@ else:
             skip_filter = skip_filter.strip().lower() in ("1", "true", "yes", "on")
         result = BOT.control(action, symbol=symbol, strategy=strategy,
                              skip_filter=bool(skip_filter))
+        if action in ("reconnect", "restart_bot"):
+            # If the bot thread exited (e.g. after login failure), start it again.
+            ensure_bot()
+            if not bot_running():
+                start_background_bot()
         status = 200 if result.get("ok") else 400
         resp = jsonify(result)
         resp.headers["Cache-Control"] = "no-store"
