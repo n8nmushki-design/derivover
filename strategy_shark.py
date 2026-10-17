@@ -48,6 +48,7 @@ class SharkEngine:
         self._buf: List[float] = []
         self.last_signal: Optional[SharkSignal] = None
         self.last_eval_reason: str = "collecting data"
+        self.levels: dict = {}
 
     def on_tick(self, price: float) -> Optional[SharkSignal]:
         try:
@@ -107,6 +108,16 @@ class SharkEngine:
             return None
         mid = leg_lo + 0.5 * (leg_hi - leg_lo)
         price = closes[-1]
+        level_886_preview = (
+            leg_hi - 0.886 * (leg_hi - leg_lo) if bearish_bos
+            else leg_lo + 0.886 * (leg_hi - leg_lo)
+        )
+        self.levels = {
+            "leg_lo": leg_lo, "leg_hi": leg_hi, "mid": mid,
+            "fib_886": level_886_preview,
+            "bos": "bullish" if bullish_bos else "bearish",
+            "price": price,
+        }
         in_discount = price <= mid
         in_premium = price >= mid
 
@@ -116,6 +127,8 @@ class SharkEngine:
             self.last_eval_reason = "no unmitigated order block"
             return None
         ob_lo, ob_hi = ob
+        self.levels["ob_lo"] = ob_lo
+        self.levels["ob_hi"] = ob_hi
         # Mitigation: price closed through OB
         if bullish_bos and closes[-1] < ob_lo:
             self.last_eval_reason = "bullish OB mitigated"
@@ -229,11 +242,14 @@ class SharkEngine:
         return (b["l"], b["h"])
 
     def status(self) -> dict:
+        closes = [b["c"] for b in self.bars[-80:]] if self.bars else []
         return {
             "symbol": self.symbol,
             "bars": len(self.bars),
             "ticks": len(self.ticks),
             "reason": self.last_eval_reason,
+            "levels": dict(self.levels or {}),
+            "closes": closes,
             "last_signal": None
             if not self.last_signal
             else {

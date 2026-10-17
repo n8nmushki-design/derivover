@@ -100,7 +100,11 @@ button:disabled{opacity:.45;cursor:not-allowed}
   body.mode-shark .ctrl-btn.bg-primary-container { background: linear-gradient(135deg,#00F2FE,#4FACFE) !important; color:#05070A !important; }
   #modeBanner { display:none; }
   body.mode-shark #modeBanner { display:block; }
-  body.mode-digits #modeBannerDigits { display:block; }
+    body.mode-digits .shark-only, body.mode-digits #sharkDashPanel { display: none !important; }
+  body.mode-shark .digits-only { display: none !important; }
+  body.mode-shark #sharkDashPanel { display: block; }
+  body.mode-digits #sharkDashPanel { display: none !important; }
+
   body.mode-shark #modeBannerDigits { display:none; }
   .shark-card {
     border: 1px solid rgba(0,242,254,0.25);
@@ -113,7 +117,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 </style>
 
 </head>
-<body class="mode-digits min-h-screen antialiased">
+<body class="mode-shark min-h-screen antialiased">
 
 <aside class="desktop-only fixed left-0 top-0 h-full w-64 bg-surface-container-lowest z-50 flex flex-col justify-between py-4 shadow-[0_1px_8px_rgba(0,0,0,0.4)]">
   <div class="flex flex-col gap-6">
@@ -247,7 +251,47 @@ button:disabled{opacity:.45;cursor:not-allowed}
 
 
 <section id="page-dashboard" class="page active space-y-4">
-  <div class="grid grid-cols-1 lg:grid-cols-5 gap-4">
+  <!-- Command-center overview -->
+  <div id="dashOverview" class="grid grid-cols-2 sm:grid-cols-4 gap-2"></div>
+
+  <!-- SHARK real-time panel (visible in shark mode) -->
+  <div id="sharkDashPanel" class="space-y-4">
+    <div class="flex flex-wrap items-center gap-2">
+      <button type="button" data-action="start_strategy" class="ctrl-btn px-4 py-2.5 rounded-xl text-sm font-semibold shark-card border border-cyan-400/40">
+        <span class="material-symbols-outlined text-[18px] align-middle mr-1">play_arrow</span> Start Shark Strategy
+      </button>
+      <button type="button" data-action="set_mode" data-mode="digits" class="ctrl-btn px-3 py-2 rounded-xl text-xs font-semibold border border-outline-variant/40">Switch to Digits</button>
+      <button type="button" data-action="reconnect" class="ctrl-btn px-3 py-2 rounded-xl text-xs font-semibold border border-outline-variant/40">Reconnect</button>
+    </div>
+    <div class="shark-card rounded-xl p-3 lg:p-4">
+      <div class="flex items-center justify-between mb-2">
+        <div>
+          <div class="text-[10px] font-mono uppercase" style="color:#00E5FF">Live chart · Deriv ticks</div>
+          <div class="text-sm font-semibold" id="chartTitle">R_75</div>
+        </div>
+        <div class="text-right">
+          <div class="text-lg font-semibold" id="chartPrice">—</div>
+          <div class="text-[11px] text-on-surface-variant" id="chartStatus">Waiting for ticks…</div>
+        </div>
+      </div>
+      <canvas id="sharkChart" height="220" class="w-full rounded-lg bg-black/30"></canvas>
+      <div class="flex flex-wrap gap-3 mt-2 text-[10px] font-mono text-on-surface-variant">
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#00F2FE"></i>Price</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#FFB020"></i>0.5 mid</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#A78BFA"></i>0.886</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#34D399"></i>OB zone</span>
+      </div>
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="sharkLevels"></div>
+    <div class="rounded-xl border border-outline-variant/20 bg-surface-container p-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-sm font-semibold">Trade history</h2>
+        <button type="button" data-goto="trades" class="text-[11px] font-medium" style="color:#00E5FF">Full history →</button>
+      </div>
+      <div id="sharkTradeHist" class="overflow-x-auto text-sm"></div>
+    </div>
+  </div>
+  <div class="grid grid-cols-1 lg:grid-cols-5 gap-4 digits-only">
     <div class="lg:col-span-3 rounded-xl bg-surface-container border border-outline-variant/20 p-4 lg:p-5">
       <div class="flex items-center justify-between mb-1">
         <span class="text-[11px] font-mono uppercase tracking-wide text-on-surface-variant">Real-time account balance</span>
@@ -275,7 +319,8 @@ button:disabled{opacity:.45;cursor:not-allowed}
     </div>
   </div>
   <div class="grid grid-cols-2 lg:grid-cols-4 gap-3" id="stats"></div>
-  <div class="rounded-xl bg-surface-container border border-outline-variant/20 p-4">
+  <div id="dashQuick" class="flex flex-wrap gap-2"></div>
+  <div class="rounded-xl bg-surface-container border border-outline-variant/20 p-4 digits-only">
     <div class="flex items-center justify-between mb-3"><h2 class="text-sm font-semibold">Real-time market digits</h2>
       <button type="button" data-goto="markets" class="text-[11px] text-primary font-medium">View all →</button></div>
     <div id="dashMarkets"></div>
@@ -717,8 +762,153 @@ else{list.innerHTML=ev.map(row).join("");$("dashEvents").innerHTML=ev.slice(0,8)
 if(autoScrollLogs){list.scrollTop=list.scrollHeight}}
 }
 
+
+function renderQuickActions(){
+  var el=$("dashQuick");
+  if(!el||!S)return;
+  var mode=(S.strategy_mode||"digits");
+  el.innerHTML=
+    '<button type="button" data-action="start_strategy" class="ctrl-btn px-3 py-1.5 rounded-lg border text-xs font-semibold '+(mode==="shark"?"shark-card":"digits-card border-primary/40")+'">▶ Start strategy</button>'+
+    '<button type="button" data-action="reconnect" class="ctrl-btn px-3 py-1.5 rounded-lg border border-outline-variant/40 text-xs font-semibold">Reconnect</button>'+
+    '<button type="button" data-action="set_mode" data-mode="shark" class="ctrl-btn px-3 py-1.5 rounded-lg border text-xs font-semibold '+(mode==="shark"?"shark-card":"border-outline-variant/40")+'">Shark</button>'+
+    '<button type="button" data-action="set_mode" data-mode="digits" class="ctrl-btn px-3 py-1.5 rounded-lg border text-xs font-semibold '+(mode==="digits"?"digits-card border-primary/40":"border-outline-variant/40")+'">Digits</button>'+
+    '<button type="button" data-goto="trades" class="px-3 py-1.5 rounded-lg border border-outline-variant/40 text-xs font-semibold">Trade history</button>';
+}
+function renderOverview(){
+  var el=$("dashOverview");
+  if(!el)return;
+  if(!S){
+    el.innerHTML='<div class="col-span-2 sm:col-span-4 rounded-xl border border-outline-variant/20 bg-surface-container p-3 text-sm text-on-surface-variant">Waiting for bot status…</div>';
+    return;
+  }
+  var mode=(S.strategy_mode||"digits");
+  var conn=S.connected;
+  var run=S.bot_running;
+  var paused=S.paused;
+  var stopped=S.stopped;
+  var statusLabel=stopped?"Stopped":(paused?"Paused":(conn?"Live":"Connecting"));
+  var statusColor=stopped?"text-error":(paused?"text-primary":(conn?"text-emerald-400":"text-primary"));
+  var acct=(S.account&&S.account.type)||"—";
+  var sup=S.supabase&&S.supabase.enabled;
+  var shark=S.shark||{};
+  var pl=S.session_pl;
+  var plTxt=pl==null?"—":((pl>=0?"+":"")+Number(pl).toFixed(2));
+  var plCls=pl==null?"":(pl>=0?"text-emerald-400":"text-error");
+  var trades=S.stats?S.stats.trades:0;
+  var max=S.limits?S.limits.max_trades:50;
+  var modeExtra=mode==="shark"
+    ? ("Shark · "+esc(shark.symbol||"R_75")+" · "+esc((shark.reason||"").slice(0,40)))
+    : "Digits · Over 0 / Under 9";
+
+  function tile(label, value, sub, vCls){
+    return '<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-3">'+
+      '<div class="text-[10px] font-mono uppercase text-on-surface-variant mb-1">'+label+'</div>'+
+      '<div class="text-base font-semibold '+(vCls||"")+'">'+value+'</div>'+
+      (sub?('<div class="text-[11px] text-on-surface-variant mt-0.5 truncate">'+sub+'</div>'):'')+
+    '</div>';
+  }
+  el.innerHTML=
+    tile("Status", statusLabel, run?(conn?"WebSocket up":"Waiting for ticks"):"Thread off", statusColor)+
+    tile("Strategy", mode==="shark"?"Shark":"Digits", modeExtra, mode==="shark"?"":"text-primary")+
+    tile("Session P/L", plTxt, "Account "+esc(String(acct)), plCls)+
+    tile("Trades", String(trades)+" / "+String(max), sup?"Supabase on":"Supabase off", "");
+}
+
+
+function drawSharkChart(){
+  var canvas=$("sharkChart");
+  if(!canvas||!S)return;
+  var ctx=canvas.getContext("2d");
+  var dpr=window.devicePixelRatio||1;
+  var rect=canvas.getBoundingClientRect();
+  var w=Math.max(280,Math.floor(rect.width||320));
+  var h=220;
+  canvas.width=w*dpr; canvas.height=h*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  var pts=(S.chart&&S.chart.points)||[];
+  var shark=S.shark||{};
+  var levels=shark.levels||{};
+  // Prefer engine closes if more bars
+  if((!pts||pts.length<5) && shark.closes && shark.closes.length){
+    pts=shark.closes.map(function(c,i){return [i,c];});
+  }
+  $("chartTitle").textContent=(S.chart&&S.chart.symbol)||shark.symbol||"R_75";
+  $("chartStatus").textContent=shark.reason||(S.connected?"Streaming…":"Offline");
+  if(!pts.length){
+    ctx.fillStyle="#64748b";
+    ctx.font="12px sans-serif";
+    ctx.fillText("Waiting for live Deriv ticks…",12,h/2);
+    return;
+  }
+  var prices=pts.map(function(p){return Array.isArray(p)?Number(p[1]):Number(p);}).filter(function(x){return isFinite(x);});
+  if(!prices.length)return;
+  var lo=Math.min.apply(null,prices), hi=Math.max.apply(null,prices);
+  // expand for levels
+  ["mid","fib_886","ob_lo","ob_hi","leg_lo","leg_hi"].forEach(function(k){
+    if(levels[k]!=null&&isFinite(Number(levels[k]))){lo=Math.min(lo,Number(levels[k]));hi=Math.max(hi,Number(levels[k]));}
+  });
+  if(hi===lo){hi+=1;lo-=1;}
+  var pad= (hi-lo)*0.08; lo-=pad; hi+=pad;
+  function Y(v){return 12+(h-24)*(1-(v-lo)/(hi-lo));}
+  function X(i,n){return 8+(w-16)*(n<=1?0:i/(n-1));}
+  // OB zone
+  if(levels.ob_lo!=null&&levels.ob_hi!=null){
+    var y1=Y(Number(levels.ob_hi)), y2=Y(Number(levels.ob_lo));
+    ctx.fillStyle="rgba(52,211,153,0.12)";
+    ctx.fillRect(8,Math.min(y1,y2),w-16,Math.abs(y2-y1)||2);
+  }
+  function hline(val,color,dash){
+    if(val==null||!isFinite(Number(val)))return;
+    var y=Y(Number(val));
+    ctx.strokeStyle=color; ctx.lineWidth=1;
+    ctx.setLineDash(dash||[]);
+    ctx.beginPath(); ctx.moveTo(8,y); ctx.lineTo(w-8,y); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  hline(levels.mid,"#FFB020",[4,3]);
+  hline(levels.fib_886,"#A78BFA",[2,2]);
+  // price line
+  ctx.strokeStyle="#00F2FE"; ctx.lineWidth=2; ctx.beginPath();
+  prices.forEach(function(v,i){
+    var x=X(i,prices.length), y=Y(v);
+    if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+  // last point
+  var lx=X(prices.length-1,prices.length), ly=Y(prices[prices.length-1]);
+  ctx.fillStyle="#00F2FE"; ctx.beginPath(); ctx.arc(lx,ly,3,0,Math.PI*2); ctx.fill();
+  $("chartPrice").textContent=prices[prices.length-1].toFixed(2);
+  // levels tiles
+  var lv=$("sharkLevels");
+  if(lv){
+    var items=[
+      ["BOS", levels.bos||"—", ""],
+      ["Mid 0.5", levels.mid!=null?Number(levels.mid).toFixed(2):"—", ""],
+      ["Fib 0.886", levels.fib_886!=null?Number(levels.fib_886).toFixed(2):"—", ""],
+      ["OB", (levels.ob_lo!=null&&levels.ob_hi!=null)?(Number(levels.ob_lo).toFixed(1)+"–"+Number(levels.ob_hi).toFixed(1)):"—", ""]
+    ];
+    lv.innerHTML=items.map(function(it){
+      return '<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-3"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+it[0]+'</div><div class="text-sm font-semibold mt-0.5">'+it[1]+'</div></div>';
+    }).join("");
+  }
+}
+function renderSharkTradeHist(){
+  var el=$("sharkTradeHist");
+  if(!el||!S)return;
+  var list=(S.trades||[]).slice(0,12);
+  if(!list.length){el.innerHTML='<p class="text-sm text-on-surface-variant py-2">No trades yet. Tap Start Shark Strategy when connected.</p>';return;}
+  el.innerHTML='<table class="w-full text-left"><thead><tr class="text-[10px] font-mono uppercase text-on-surface-variant"><th class="py-1">#</th><th>Symbol</th><th>Side</th><th>P/L</th><th>Status</th></tr></thead><tbody>'+
+    list.map(function(t){
+      var side=t.side||(t.contract_type==="CALL"||t.contract_type==="DIGITOVER"?"buy":(t.contract_type==="PUT"||t.contract_type==="DIGITUNDER"?"sell":"—"));
+      var pl=t.profit==null?"—":((Number(t.profit)>=0?"+":"")+Number(t.profit).toFixed(2));
+      var cls=t.status==="won"?"text-emerald-400":t.status==="lost"?"text-error":"";
+      return '<tr class="border-t border-outline-variant/10"><td class="py-1.5 pr-2 font-mono text-on-surface-variant">'+t.n+'</td><td class="pr-2">'+esc(t.symbol)+'</td><td class="pr-2">'+esc(String(side))+'</td><td class="pr-2 '+cls+'">'+pl+'</td><td>'+esc(t.status)+'</td></tr>';
+    }).join("")+'</tbody></table>';
+}
+
 function applyModeTheme(){
-  var mode=(S&&S.strategy_mode)||"digits";
+  var mode=(S&&S.strategy_mode)||"shark";
   document.body.classList.remove("mode-digits","mode-shark");
   document.body.classList.add(mode==="shark"?"mode-shark":"mode-digits");
   var title=$("mobileTitle");
@@ -726,7 +916,7 @@ function applyModeTheme(){
     // keep structure; subtitle via sibling if any
   }
 }
-function render(){applyModeTheme();renderHeader();renderAlerts();renderAge();updateControlUI();if(!S)return;renderBalance();renderStats();renderMarkets();renderTrades();renderStrategy();renderEvents()}
+function render(){applyModeTheme();renderHeader();renderAlerts();renderAge();updateControlUI();renderOverview();renderQuickActions();if(!S)return;renderBalance();renderStats();renderMarkets();renderTrades();renderStrategy();renderEvents();if((S.strategy_mode||"shark")==="shark"){drawSharkChart();renderSharkTradeHist()}}
 
 /* ----- auto-trade controls ----- */
 function setCtrlMsg(msg, ok){

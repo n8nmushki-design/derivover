@@ -100,6 +100,17 @@ MAX_01_FREQUENCY     = 0.10
 MAX_89_FREQUENCY     = 0.10
 MIN_TICKS_FOR_FILTER = 50
 
+# Strategy modes: digits (Over/Under) or shark (Structure+OB+0.886)
+STRATEGY_MODES = ("digits", "shark")
+DEFAULT_STRATEGY_MODE = (os.environ.get("STRATEGY_MODE", "shark") or "shark").strip().lower()
+if DEFAULT_STRATEGY_MODE not in STRATEGY_MODES:
+    DEFAULT_STRATEGY_MODE = "shark"
+SHARK_SYMBOL = (os.environ.get("SHARK_SYMBOL", "R_75") or "R_75").strip()
+try:
+    SHARK_DURATION_TICKS = int(os.environ.get("SHARK_DURATION_TICKS", "5") or 5)
+except ValueError:
+    SHARK_DURATION_TICKS = 5
+
 # Both strategies are active at once.
 STRATEGIES = {
     "over":  {"label": "Over 0",  "kind": "Over",  "contract": "DIGITOVER",
@@ -293,6 +304,7 @@ class Bot:
         self.events          = deque(maxlen=100)     # newest first
         self.trade_log       = deque(maxlen=500)     # oldest first
         self.balance_history = deque(maxlen=300)     # [timestamp, balance]
+        self.price_history = defaultdict(lambda: deque(maxlen=240))  # symbol -> [t, price]
         self.last_price      = {}                    # symbol -> latest quote
         self.pending_trade   = None                  # trade waiting for its buy confirmation
         self.pending_since   = 0.0
@@ -348,6 +360,7 @@ class Bot:
             "shark": None,
             "shark_status": {},
             "_pending_shark_signal": None,
+            "price_history": None,
             "limit_hit_at": None,
         }
         for k, v in defaults.items():
@@ -527,6 +540,23 @@ class Bot:
         if action == "reset_session":
             self.reset_session()
             return {"ok": True, "message": "Session reset"}
+        if action in ("start", "start_strategy", "start_bot"):
+            # Start / arm active strategy: clear stop, unpause, ensure engine
+            mode = getattr(self, "strategy_mode", DEFAULT_STRATEGY_MODE) or DEFAULT_STRATEGY_MODE
+            with self.lock:
+                self.stop = False
+                self.stop_reason = None
+                self.restart_at = None
+                self.paused = False
+                if mode == "shark" and getattr(self, "shark", None) is None:
+                    try:
+                        if SharkEngine is not None:
+                            self.shark = SharkEngine(SHARK_SYMBOL)
+                    except Exception:
+                        pass
+            self.reconnect_requested = True
+            self.note("info", f"Strategy started ({mode})")
+            return {"ok": True, "message": f"Started {mode} strategy"}
         if action in ("set_mode", "strategy_mode", "set_strategy"):
             mode = (
                 kwargs.get("mode")
@@ -725,6 +755,14 @@ class Bot:
                     "enabled": bool(_supa() and getattr(_supa(), "enabled", False)),
                     "session_id": getattr(_supa(), "current_session_id", None) if _supa() else None,
                     "last_error": getattr(_supa(), "last_error", None) if _supa() else None,
+                },
+                "strategy_mode": getattr(self, "strategy_mode", DEFAULT_STRATEGY_MODE),
+                "shark": (getattr(self, "shark").status() if getattr(self, "shark", None) else {"reason": "unavailable"}),
+                "chart": {
+                    "symbol": SHARK_SYMBOL,
+                    "points": list((getattr(self, "price_history", None) or {}).get(SHARK_SYMBOL, []))[-180:]
+                    if getattr(self, "price_history", None) is not None
+                    else [],
                 },
                 "account": dict(ACCOUNT),
                 "currency": self.currency,
@@ -980,6 +1018,11 @@ class Bot:
 
             digit = self.tick_digit(symbol, tick, price)
             self.digit_history[symbol].append(digit)
+            try:
+                ph = self.price_history[symbol]
+                ph.append([round(time.time(), 2), float(price)])
+            except Exception:
+                pass
             self.last_price[symbol] = price
             self.ticks_seen += 1
 
