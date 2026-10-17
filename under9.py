@@ -49,6 +49,12 @@ try:
 except Exception:
     SUPA = None  # type: ignore
 
+try:
+    from strategy_shark import SharkEngine
+except Exception as _shark_imp_err:
+    SharkEngine = None  # type: ignore
+    print(f"[shark] strategy_shark import failed: {_shark_imp_err}", flush=True)
+
 from websocket import (
     create_connection,
     WebSocketTimeoutException,
@@ -322,16 +328,38 @@ class Bot:
         self.manual_skip_filter = False              # manual trade: ignore digit filter once
         self.strategy_mode = DEFAULT_STRATEGY_MODE
         self.shark = None
+        self.shark_status = {}
         try:
-            if SharkEngine is not None:
-                self.shark = SharkEngine(SHARK_SYMBOL)
+            self.ensure_shark()
         except Exception:
             self.shark = None
-        self.shark_status = {}
         self._pending_shark_signal = None
         self.trades_window_started = time.time()     # session start (legacy)
         self.limit_hit_at = None                     # set only when MAX_TRADES is hit
         self.limit_refresh_count = 0                 # how many times limit was refreshed
+
+    def ensure_shark(self):
+        """Return SharkEngine instance or None (never raises NameError)."""
+        eng = getattr(self, "shark", None)
+        if eng is not None:
+            return eng
+        try:
+            cls = SharkEngine
+        except NameError:
+            cls = None
+        if cls is None:
+            try:
+                from strategy_shark import SharkEngine as cls  # type: ignore
+            except Exception as e:
+                self.note("warn", f"Shark engine unavailable: {e}")
+                return None
+        try:
+            self.shark = cls(SHARK_SYMBOL)
+            return self.shark
+        except Exception as e:
+            self.note("warn", f"Shark engine init failed: {e}")
+            self.shark = None
+            return None
 
     # ---------- dashboard helpers ----------
 
@@ -548,12 +576,8 @@ class Bot:
                 self.stop_reason = None
                 self.restart_at = None
                 self.paused = False
-                if mode == "shark" and getattr(self, "shark", None) is None:
-                    try:
-                        if SharkEngine is not None:
-                            self.shark = SharkEngine(SHARK_SYMBOL)
-                    except Exception:
-                        pass
+                if mode == "shark":
+                    self.ensure_shark()
             self.reconnect_requested = True
             self.note("info", f"Strategy started ({mode})")
             return {"ok": True, "message": f"Started {mode} strategy"}
@@ -574,16 +598,9 @@ class Bot:
             with self.lock:
                 self.strategy_mode = mode
                 if mode == "shark":
-                    eng = getattr(self, "shark", None)
+                    eng = self.ensure_shark()
                     if eng is None:
-                        try:
-                            if SharkEngine is not None:
-                                self.shark = SharkEngine(SHARK_SYMBOL)
-                            else:
-                                from strategy_shark import SharkEngine as _SE
-                                self.shark = _SE(SHARK_SYMBOL)
-                        except Exception as e:
-                            return {"ok": False, "message": f"Shark engine unavailable: {e}"}
+                        return {"ok": False, "message": "Shark engine unavailable – ensure strategy_shark.py is deployed"}
             self.note("info", f"Strategy mode → {mode}")
             return {"ok": True, "message": f"Strategy mode: {mode}"}
         return {"ok": False, "message": f"Unknown action: {action}"}
@@ -1050,12 +1067,7 @@ class Bot:
             shark_eng = getattr(self, "shark", None)
             if getattr(self, "strategy_mode", "digits") == "shark" and symbol == SHARK_SYMBOL:
                 if shark_eng is None:
-                    try:
-                        if SharkEngine is not None:
-                            self.shark = SharkEngine(SHARK_SYMBOL)
-                            shark_eng = self.shark
-                    except Exception as e:
-                        self.note("warn", f"Shark engine init failed: {e}")
+                    shark_eng = self.ensure_shark()
                 if shark_eng is not None:
                     sig = shark_eng.on_tick(price)
                     self.shark_status = shark_eng.status()
