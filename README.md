@@ -92,6 +92,9 @@ curl -X POST "$URL/api/control" -H "Content-Type: application/json" \
 
 ## Supabase (optional history)
 
+Full SQL is split into **6 paste-ready parts** in [`supabase/README.md`](supabase/README.md).
+
+
 Persist sessions and trades (demo and real kept separate):
 
 1. Run [`supabase/schema.sql`](supabase/schema.sql) in the Supabase SQL Editor  

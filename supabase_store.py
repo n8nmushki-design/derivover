@@ -24,7 +24,11 @@ from typing import Any
 
 
 def _env(name: str) -> str:
-    return (os.environ.get(name) or "").strip()
+    v = (os.environ.get(name) or "").strip()
+    # Render sometimes stores values with surrounding quotes
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return v
 
 
 def _iso(ts: float | None = None) -> str:
@@ -89,6 +93,11 @@ class SupabaseStore:
     @property
     def last_error(self) -> str | None:
         return self._last_error
+
+    def reload(self) -> bool:
+        """Re-read env (useful if credentials were added after process start)."""
+        self.__init__()
+        return self.enabled
 
     def _request(
         self,

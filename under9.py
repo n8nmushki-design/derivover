@@ -513,6 +513,31 @@ class Bot:
         if action == "reset_session":
             self.reset_session()
             return {"ok": True, "message": "Session reset"}
+        if action in ("set_mode", "strategy_mode", "set_strategy"):
+            mode = (
+                kwargs.get("mode")
+                or kwargs.get("strategy_mode")
+                or kwargs.get("strategy")
+                or ""
+            )
+            mode = str(mode).strip().lower()
+            # Digit sub-preference (not a full mode switch)
+            if mode in ("over", "under"):
+                self.force_next(strategy=mode)
+                return {"ok": True, "message": f"Digit preference: {mode}"}
+            if mode not in ("digits", "shark"):
+                return {"ok": False, "message": "mode must be digits or shark"}
+            with self.lock:
+                self.strategy_mode = mode
+                if mode == "shark":
+                    try:
+                        from strategy_shark import SharkEngine
+                        if self.shark is None:
+                            self.shark = SharkEngine(SHARK_SYMBOL)
+                    except Exception:
+                        pass
+            self.note("info", f"Strategy mode → {mode}")
+            return {"ok": True, "message": f"Strategy mode: {mode}"}
         return {"ok": False, "message": f"Unknown action: {action}"}
 
 
@@ -1486,7 +1511,20 @@ else:
 
     @app.route("/health")
     def health():
-        return jsonify(ok=True, bot_running=bot_running())
+        store = _supa()
+        # Public diagnostics (no secrets) so connection issues are visible without STATUS_KEY
+        return jsonify(
+            ok=True,
+            bot_running=bot_running(),
+            connected=bool(getattr(BOT, "connected", False)),
+            account_type=ACCOUNT_TYPE,
+            strategy_mode=getattr(BOT, "strategy_mode", "digits"),
+            has_deriv_app_id=bool(APP_ID),
+            has_deriv_token=bool(TOKEN),
+            supabase_enabled=bool(store and getattr(store, "enabled", False)),
+            supabase_using_publishable=bool(store and getattr(store, "using_publishable", False)),
+            last_error=(getattr(BOT, "last_error", None) or None),
+        )
 
     @app.route("/api/state")
     @app.route("/status")
@@ -1533,8 +1571,14 @@ else:
     def api_history_sessions():
         if not key_ok():
             return jsonify(error="forbidden"), 403
-        if not _supa() or not getattr(_supa(), "enabled", False):
-            return jsonify(enabled=False, sessions=[], message="Supabase not configured")
+        store = _supa()
+        if store and not getattr(store, "enabled", False) and hasattr(store, "reload"):
+            store.reload()
+        if not store or not getattr(store, "enabled", False):
+            return jsonify(
+                enabled=False, sessions=[],
+                message="Supabase not configured on server. Set SUPABASE_URL and SUPABASE_SECRET_KEY on Render, then restart.",
+            )
         at = (request.args.get("account_type") or "").strip().lower()
         if at not in ("demo", "real"):
             at = None
@@ -1549,8 +1593,14 @@ else:
     def api_history_trades():
         if not key_ok():
             return jsonify(error="forbidden"), 403
-        if not _supa() or not getattr(_supa(), "enabled", False):
-            return jsonify(enabled=False, trades=[], message="Supabase not configured")
+        store = _supa()
+        if store and not getattr(store, "enabled", False) and hasattr(store, "reload"):
+            store.reload()
+        if not store or not getattr(store, "enabled", False):
+            return jsonify(
+                enabled=False, trades=[],
+                message="Supabase not configured on server. Set SUPABASE_URL and SUPABASE_SECRET_KEY on Render, then restart.",
+            )
         at = (request.args.get("account_type") or "").strip().lower()
         if at not in ("demo", "real"):
             at = None

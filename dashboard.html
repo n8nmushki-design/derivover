@@ -78,8 +78,42 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .chip-filter:not(.active):hover{background:#262a33}
 
 </style>
+
+<style id="mode-themes">
+  /* Digits mode – orange (default Stitch) */
+  body.mode-digits { --mode-accent: #FF7A00; --mode-accent2: #FF444F; }
+  /* Shark mode – cyan / fintech (distinct from digits) */
+  body.mode-shark {
+    --mode-accent: #00F2FE;
+    --mode-accent2: #4FACFE;
+  }
+  body.mode-shark .text-primary,
+  body.mode-shark .text-primary-container { color: #00E5FF !important; }
+  body.mode-shark .bg-primary-container { background: linear-gradient(135deg,#00F2FE,#4FACFE) !important; color: #0B0E14 !important; }
+  body.mode-shark .border-primary,
+  body.mode-shark .border-primary\/40,
+  body.mode-shark .border-primary\/50 { border-color: rgba(0,242,254,0.45) !important; }
+  body.mode-shark .bg-primary\/10 { background-color: rgba(0,242,254,0.1) !important; }
+  body.mode-shark #statusDot { box-shadow: 0 0 12px #00F2FE; }
+  body.mode-shark .mnav-item.active,
+  body.mode-shark .mnav-item.text-primary { color: #00E5FF !important; }
+  body.mode-shark .ctrl-btn.bg-primary-container { background: linear-gradient(135deg,#00F2FE,#4FACFE) !important; color:#05070A !important; }
+  #modeBanner { display:none; }
+  body.mode-shark #modeBanner { display:block; }
+  body.mode-digits #modeBannerDigits { display:block; }
+  body.mode-shark #modeBannerDigits { display:none; }
+  .shark-card {
+    border: 1px solid rgba(0,242,254,0.25);
+    background: linear-gradient(160deg, rgba(0,242,254,0.08), rgba(15,20,30,0.9));
+  }
+  .digits-card {
+    border: 1px solid rgba(255,122,0,0.25);
+    background: linear-gradient(160deg, rgba(255,122,0,0.08), rgba(15,20,30,0.9));
+  }
+</style>
+
 </head>
-<body class="min-h-screen antialiased">
+<body class="mode-digits min-h-screen antialiased">
 
 <aside class="desktop-only fixed left-0 top-0 h-full w-64 bg-surface-container-lowest z-50 flex flex-col justify-between py-4 shadow-[0_1px_8px_rgba(0,0,0,0.4)]">
   <div class="flex flex-col gap-6">
@@ -144,7 +178,27 @@ button:disabled{opacity:.45;cursor:not-allowed}
 <div id="pullHint" aria-hidden="true"><span>Release to refresh</span></div>
 <main class="min-h-screen">
 <div class="max-w-7xl mx-auto px-4 lg:px-6 py-4 lg:py-6 space-y-4">
-<div id="alerts" class="space-y-2"></div>
+
+    <div id="modeBannerDigits" class="rounded-xl digits-card px-4 py-3 mb-2">
+      <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined text-primary text-[20px]">ssid_chart</span>
+        <div>
+          <div class="text-sm font-semibold text-primary">Digits mode · Over 0 / Under 9</div>
+          <div class="text-[11px] text-on-surface-variant">Tick digit scanner on volatility indices</div>
+        </div>
+      </div>
+    </div>
+    <div id="modeBanner" class="rounded-xl shark-card px-4 py-3 mb-2">
+      <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined text-[20px]" style="color:#00F2FE">waterfall_chart</span>
+        <div>
+          <div class="text-sm font-semibold" style="color:#00E5FF">Shark mode · Structure + Order Block + 0.886</div>
+          <div class="text-[11px] text-on-surface-variant">Confluence system on R_75 (CALL/PUT)</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="alerts" class="space-y-2"></div>
     <div id="unlockPanel" class="hidden rounded-xl border border-primary/40 bg-primary/10 px-4 py-4 space-y-3">
       <div>
         <strong class="font-semibold text-sm">Dashboard key required</strong>
@@ -519,19 +573,24 @@ function tradeTable(list){
 function loadHistory(){
   var headers=key?{"X-Status-Key":key}:{};
   return Promise.all([
-    fetch("/api/history/sessions?limit=30",{headers:headers,cache:"no-store"}).then(function(r){return r.json().catch(function(){return null})}).catch(function(){return null}),
-    fetch("/api/history/trades?limit=50",{headers:headers,cache:"no-store"}).then(function(r){return r.json().catch(function(){return null})}).catch(function(){return null})
+    fetch("/api/history/sessions?limit=30",{headers:headers,cache:"no-store"}).then(function(r){return r.json().then(function(j){j._http=r.status;return j}).catch(function(){return {_http:r.status}})}).catch(function(){return null}),
+    fetch("/api/history/trades?limit=50",{headers:headers,cache:"no-store"}).then(function(r){return r.json().then(function(j){j._http=r.status;return j}).catch(function(){return {_http:r.status}})}).catch(function(){return null})
   ]).then(function(pair){
     var sess=pair[0],tr=pair[1];
-    if(sess){
-      histEnabled=sess.enabled!==false;
+    if(sess && sess._http===403){histMsg="Unlock with STATUS_KEY to load Supabase history.";histEnabled=false;histSessions=[];}
+    else if(sess){
+      histEnabled=sess.enabled===true || (sess.enabled!==false && (sess.sessions||[]).length>0);
+      if(sess.enabled===false) histEnabled=false;
       histMsg=sess.message||sess.error||"";
       histSessions=Array.isArray(sess.sessions)?sess.sessions:[];
+      if(sess.enabled===true) histEnabled=true;
     }
-    if(tr){
-      if(tr.enabled===false)histEnabled=false;
-      if(tr.message||tr.error)histMsg=tr.message||tr.error||histMsg;
+    if(tr && tr._http===403){/* keep histMsg */}
+    else if(tr){
+      if(tr.enabled===false) histEnabled=false;
+      if(tr.message||tr.error) histMsg=tr.message||tr.error||histMsg;
       histTrades=Array.isArray(tr.trades)?tr.trades:[];
+      if(tr.enabled===true) histEnabled=true;
     }
     histLoaded=Date.now();
     try{renderTrades()}catch(err){}
@@ -610,15 +669,40 @@ function strategyCards(){return(S.strategies||[]).map(function(s){var cur=s.barr
 function renderStrategy(){
   var mode=(S&&S.strategy_mode)||"digits";
   var shark=S&&S.shark?S.shark:{};
-  var modeBar='<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-4 mb-4">'+
-    '<div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Active strategy mode</div>'+
-    '<div class="flex flex-wrap gap-2">'+
-      '<button type="button" data-action="set_mode" data-mode="digits" class="ctrl-btn px-4 py-2 rounded-lg text-xs font-semibold border '+(mode==="digits"?"bg-primary-container text-on-primary border-primary":"border-outline-variant/40")+'">Digits Over/Under</button>'+
-      '<button type="button" data-action="set_mode" data-mode="shark" class="ctrl-btn px-4 py-2 rounded-lg text-xs font-semibold border '+(mode==="shark"?"bg-primary-container text-on-primary border-primary":"border-outline-variant/40")+'">Structure + OB + Shark</button>'+
-    '</div>'+
-    '<p class="text-[11px] text-on-surface-variant mt-2">'+(mode==="shark"?("Shark "+esc(shark.symbol||"R_75")+" · "+esc(shark.reason||"…")+" · bars "+(shark.bars||0)):"Dual digit scanner: Over 0 + Under 9")+'</p></div>';
-  $("strategyBody").innerHTML=modeBar+strategyCards();
-  $("dashStrategy").innerHTML=modeBar+strategyCards();
+  var picker='<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-4 mb-4">'+
+    '<div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Choose strategy</div>'+
+    '<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">'+
+      '<button type="button" data-action="set_mode" data-mode="digits" class="ctrl-btn text-left rounded-xl p-4 border transition '+(mode==="digits"?"digits-card ring-1 ring-primary/40":"border-outline-variant/30 opacity-80")+'">'+
+        '<div class="flex items-center gap-2 mb-1"><span class="material-symbols-outlined text-primary">ssid_chart</span><span class="font-semibold">Digits Over / Under</span></div>'+
+        '<p class="text-[11px] text-on-surface-variant">Dual scanner on tick last digits. Barriers ladder, frequency filter, 1-tick DIGITOVER / DIGITUNDER.</p>'+
+      '</button>'+
+      '<button type="button" data-action="set_mode" data-mode="shark" class="ctrl-btn text-left rounded-xl p-4 border transition '+(mode==="shark"?"shark-card ring-1 ring-cyan-400/40":"border-outline-variant/30 opacity-80")+'">'+
+        '<div class="flex items-center gap-2 mb-1"><span class="material-symbols-outlined" style="color:#00F2FE">waterfall_chart</span><span class="font-semibold" style="color:'+(mode==="shark"?"#00E5FF":"inherit")+'">Structure + OB + Shark</span></div>'+
+        '<p class="text-[11px] text-on-surface-variant">BOS + Order Block in premium/discount + 0.886 Shark on R_75. Trades CALL / PUT.</p>'+
+      '</button>'+
+    '</div></div>';
+
+  var body="";
+  if(mode==="shark"){
+    var sig=shark.last_signal;
+    body='<div class="shark-card rounded-xl p-4 space-y-3">'+
+      '<div class="text-[10px] font-mono uppercase" style="color:#00E5FF">Shark engine · '+esc(shark.symbol||"R_75")+'</div>'+
+      '<div class="grid grid-cols-2 sm:grid-cols-4 gap-2">'+
+        '<div class="rounded-lg bg-black/30 p-3"><div class="text-[10px] text-on-surface-variant">Bars</div><div class="text-lg font-semibold">'+(shark.bars||0)+'</div></div>'+
+        '<div class="rounded-lg bg-black/30 p-3"><div class="text-[10px] text-on-surface-variant">Ticks</div><div class="text-lg font-semibold">'+(shark.ticks||0)+'</div></div>'+
+        '<div class="rounded-lg bg-black/30 p-3 col-span-2"><div class="text-[10px] text-on-surface-variant">Status</div><div class="text-sm font-medium">'+(esc(shark.reason||"…"))+'</div></div>'+
+      '</div>'+
+      (sig?('<div class="rounded-lg border border-cyan-400/30 p-3"><div class="text-[10px] font-mono uppercase mb-1" style="color:#00E5FF">Last signal</div><div class="text-sm font-semibold">'+esc(sig.side||"").toUpperCase()+' · '+esc(sig.reason||"")+'</div><div class="text-[11px] text-on-surface-variant mt-1">Entry '+(sig.entry!=null?Number(sig.entry).toFixed(2):"—")+' · SL '+(sig.sl!=null?Number(sig.sl).toFixed(2):"—")+' · TP1 '+(sig.tp1!=null?Number(sig.tp1).toFixed(2):"—")+'</div></div>'):
+        '<div class="text-[12px] text-on-surface-variant">Waiting for full confluence (BOS + OB zone + 0.886). Keep the bot connected so bars can build.</div>')+
+      '<ul class="text-[11px] text-on-surface-variant list-disc pl-4 space-y-1">'+
+        '<li>Filter 1 — Market structure (BOS)</li><li>Filter 2 — Order block in discount (buy) / premium (sell)</li><li>Filter 3 — Shark 0.886 at the order block</li>'+
+      '</ul></div>';
+  }else{
+    body='<div class="digits-card rounded-xl p-4 mb-3"><div class="text-[10px] font-mono uppercase text-primary mb-2">Digit engines</div>'+strategyCards()+'</div>';
+  }
+
+  $("strategyBody").innerHTML=picker+body;
+  $("dashStrategy").innerHTML=picker+'<div class="mt-2">'+(mode==="shark"?body:strategyCards())+'</div>';
   if(S.limits){
     $("riskLimits").innerHTML=[["Stake",money(S.limits.stake)],["Stop-loss","−"+money(S.limits.stop_loss)],["Take-profit","+"+money(S.limits.take_profit)],["Max trades",String(S.limits.max_trades)],["Mode",String(mode)]].map(function(x){
       return '<div class="rounded-lg bg-surface-container-low p-3 border border-outline-variant/15"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+x[0]+'</div><div class="text-base font-semibold mt-0.5">'+x[1]+"</div></div>";
@@ -633,7 +717,16 @@ else{list.innerHTML=ev.map(row).join("");$("dashEvents").innerHTML=ev.slice(0,8)
 if(autoScrollLogs){list.scrollTop=list.scrollHeight}}
 }
 
-function render(){renderHeader();renderAlerts();renderAge();updateControlUI();if(!S)return;renderBalance();renderStats();renderMarkets();renderTrades();renderStrategy();renderEvents()}
+function applyModeTheme(){
+  var mode=(S&&S.strategy_mode)||"digits";
+  document.body.classList.remove("mode-digits","mode-shark");
+  document.body.classList.add(mode==="shark"?"mode-shark":"mode-digits");
+  var title=$("mobileTitle");
+  if(title){
+    // keep structure; subtitle via sibling if any
+  }
+}
+function render(){applyModeTheme();renderHeader();renderAlerts();renderAge();updateControlUI();if(!S)return;renderBalance();renderStats();renderMarkets();renderTrades();renderStrategy();renderEvents()}
 
 /* ----- auto-trade controls ----- */
 function setCtrlMsg(msg, ok){
