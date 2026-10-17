@@ -308,6 +308,15 @@ class Bot:
         self.manual_symbol   = None                  # optional one-shot force symbol
         self.manual_strategy = None                  # "over" | "under" | None (auto)
         self.manual_skip_filter = False              # manual trade: ignore digit filter once
+        self.strategy_mode = DEFAULT_STRATEGY_MODE
+        self.shark = None
+        try:
+            if SharkEngine is not None:
+                self.shark = SharkEngine(SHARK_SYMBOL)
+        except Exception:
+            self.shark = None
+        self.shark_status = {}
+        self._pending_shark_signal = None
         self.trades_window_started = time.time()     # session start (legacy)
         self.limit_hit_at = None                     # set only when MAX_TRADES is hit
         self.limit_refresh_count = 0                 # how many times limit was refreshed
@@ -335,6 +344,11 @@ class Bot:
             "session_count": 0,
             "last_error": None,
             "currency": "USD",
+            "strategy_mode": "digits",
+            "shark": None,
+            "shark_status": {},
+            "_pending_shark_signal": None,
+            "limit_hit_at": None,
         }
         for k, v in defaults.items():
             if not hasattr(self, k):
@@ -530,12 +544,16 @@ class Bot:
             with self.lock:
                 self.strategy_mode = mode
                 if mode == "shark":
-                    try:
-                        from strategy_shark import SharkEngine
-                        if self.shark is None:
-                            self.shark = SharkEngine(SHARK_SYMBOL)
-                    except Exception:
-                        pass
+                    eng = getattr(self, "shark", None)
+                    if eng is None:
+                        try:
+                            if SharkEngine is not None:
+                                self.shark = SharkEngine(SHARK_SYMBOL)
+                            else:
+                                from strategy_shark import SharkEngine as _SE
+                                self.shark = _SE(SHARK_SYMBOL)
+                        except Exception as e:
+                            return {"ok": False, "message": f"Shark engine unavailable: {e}"}
             self.note("info", f"Strategy mode → {mode}")
             return {"ok": True, "message": f"Strategy mode: {mode}"}
         return {"ok": False, "message": f"Unknown action: {action}"}
@@ -986,9 +1004,20 @@ class Bot:
                 self.last_status[symbol] = status_key
 
             # Shark mode: evaluate structure/OB/0.886 on configured symbol
-            if getattr(self, "strategy_mode", "digits") == "shark" and self.shark and symbol == SHARK_SYMBOL:
-                sig = self.shark.on_tick(price)
-                self.shark_status = self.shark.status()
+            shark_eng = getattr(self, "shark", None)
+            if getattr(self, "strategy_mode", "digits") == "shark" and symbol == SHARK_SYMBOL:
+                if shark_eng is None:
+                    try:
+                        if SharkEngine is not None:
+                            self.shark = SharkEngine(SHARK_SYMBOL)
+                            shark_eng = self.shark
+                    except Exception as e:
+                        self.note("warn", f"Shark engine init failed: {e}")
+                if shark_eng is not None:
+                    sig = shark_eng.on_tick(price)
+                    self.shark_status = shark_eng.status()
+                else:
+                    sig = None
                 if sig:
                     self._pending_shark_signal = sig
                     self.note("info", f"Shark signal: {sig.side} {symbol} – {sig.reason}")

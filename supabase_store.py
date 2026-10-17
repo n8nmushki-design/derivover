@@ -99,6 +99,24 @@ class SupabaseStore:
         self.__init__()
         return self.enabled
 
+
+    # Columns that may be missing until migration is applied
+    _OPTIONAL_SESSION_COLS = ("strategy_mode",)
+    _OPTIONAL_TRADE_COLS = ("strategy_mode", "side", "setup_meta")
+
+    def _post_row(self, table: str, row: dict, optional_cols: tuple = ()) -> any:
+        """POST a row; if schema cache rejects unknown columns, retry without them."""
+        data = self._request("POST", table, row, prefer="return=representation")
+        if data is not None:
+            return data
+        err = (self._last_error or "")
+        if "PGRST204" in err or "Could not find" in err:
+            cleaned = {k: v for k, v in row.items() if k not in optional_cols}
+            if cleaned != row:
+                print(f"[supabase] retry {table} without optional columns {optional_cols}", flush=True)
+                return self._request("POST", table, cleaned, prefer="return=representation")
+        return None
+
     def _request(
         self,
         method: str,
@@ -170,12 +188,7 @@ class SupabaseStore:
             "strategy_mode": strategy_mode if strategy_mode in ("digits", "shark") else "digits",
         }
         with self._lock:
-            data = self._request(
-                "POST",
-                "trading_sessions",
-                row,
-                prefer="return=representation",
-            )
+            data = self._post_row("trading_sessions", row, self._OPTIONAL_SESSION_COLS)
             if isinstance(data, list) and data:
                 sid = data[0].get("id")
                 self.current_session_id = sid
@@ -284,13 +297,7 @@ class SupabaseStore:
             "currency": currency or "USD",
         }
         with self._lock:
-            # Plain insert; unique (account_type, contract_id) prevents duplicates
-            self._request(
-                "POST",
-                "trades",
-                row,
-                prefer="return=minimal",
-            )
+            self._post_row("trades", row, self._OPTIONAL_TRADE_COLS)
 
     def save_trade_close(self, rec: dict, *, account_type: str) -> None:
         if not self.enabled:
@@ -332,7 +339,13 @@ class SupabaseStore:
             "traded": False,
         }
         with self._lock:
-            self._request("POST", "shark_signals", row, prefer="return=minimal")
+            data = self._request("POST", "shark_signals", row, prefer="return=minimal")
+            if data is None and self._last_error and (
+                "PGRST205" in (self._last_error or "")
+                or "could not find the table" in (self._last_error or "").lower()
+                or "shark_signals" in (self._last_error or "")
+            ):
+                print("[supabase] shark_signals table missing – run Part 6 SQL in supabase/README.md", flush=True)
 
     def list_sessions(self, *, account_type: str | None = None, limit: int = 30) -> list:
         if not self.enabled:
