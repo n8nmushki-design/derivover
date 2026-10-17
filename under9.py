@@ -542,6 +542,7 @@ class Bot:
                 session_no=getattr(self, "session_count", 1) or 1,
                 start_balance=self.start_balance if self.start_balance is not None else self.balance,
                 currency=self.currency or "USD",
+                strategy_mode=getattr(self, "strategy_mode", "digits"),
             )
         except Exception as e:
             self.note("warn", f"Supabase session start failed: {e}")
@@ -811,6 +812,44 @@ class Bot:
         if key is None:
             return
 
+        # ---- Shark mode: Rise/Fall (CALL/PUT) ----
+        if key == "shark":
+            sig = getattr(self, "_pending_shark_signal", None)
+            if not sig:
+                return
+            ctype = "CALL" if sig.side == "buy" else "PUT"
+            print(f"\n★ SHARK {symbol} {sig.side.upper()} @ {price:.5f} – {sig.reason}")
+            if not TRADING_ENABLED:
+                print("  [signals only] TRADING_ENABLED=False")
+                self._pending_shark_signal = None
+                return
+            self.pending = True
+            self.pending_since = time.time()
+            self.pending_trade = {
+                "symbol": symbol,
+                "contract_type": ctype,
+                "barrier": None,
+                "strategy": "shark",
+                "side": sig.side,
+                "setup_meta": sig.meta,
+                "strategy_mode": "shark",
+            }
+            self._pending_shark_signal = None
+            ws.send(json.dumps({
+                "buy": 1,
+                "price": STAKE,
+                "parameters": {
+                    "amount": STAKE,
+                    "basis": "stake",
+                    "contract_type": ctype,
+                    "currency": self.currency,
+                    "duration": SHARK_DURATION_TICKS,
+                    "duration_unit": "t",
+                    "underlying_symbol": symbol,
+                },
+            }))
+            return
+
         s       = STRATEGIES[key]
         barrier = str(self.current_barrier(key))
         ctype   = s["contract"]
@@ -827,7 +866,8 @@ class Bot:
         self.pending = True
         self.pending_since = time.time()
         self.pending_trade = {"symbol": symbol, "contract_type": ctype,
-                              "barrier": int(barrier), "strategy": key}
+                              "barrier": int(barrier), "strategy": key,
+                              "strategy_mode": "digits"}
         self.manual_symbol = None
         self.manual_strategy = None
         self.manual_skip_filter = False
@@ -920,7 +960,22 @@ class Bot:
                       f"Under {self.current_barrier('under')})")
                 self.last_status[symbol] = status_key
 
-            self.try_trade(ws, symbol, price)
+            # Shark mode: evaluate structure/OB/0.886 on configured symbol
+            if getattr(self, "strategy_mode", "digits") == "shark" and self.shark and symbol == SHARK_SYMBOL:
+                sig = self.shark.on_tick(price)
+                self.shark_status = self.shark.status()
+                if sig:
+                    self._pending_shark_signal = sig
+                    self.note("info", f"Shark signal: {sig.side} {symbol} – {sig.reason}")
+                    try:
+                        store = _supa()
+                        if store and hasattr(store, "save_shark_signal"):
+                            store.save_shark_signal(sig, account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                                                   account_id=ACCOUNT.get("id"))
+                    except Exception:
+                        pass
+            if getattr(self, "strategy_mode", "digits") == "digits" or symbol == SHARK_SYMBOL:
+                self.try_trade(ws, symbol, price)
 
         # ---- balance ----
         elif t == "balance" or "balance" in msg:
@@ -998,6 +1053,9 @@ class Bot:
                 "contract_type": pt.get("contract_type", STRATEGIES[strategy]["contract"]),
                 "barrier": pt.get("barrier", self.current_barrier(strategy)),
                 "strategy": strategy,
+                "strategy_mode": pt.get("strategy_mode") or getattr(self, "strategy_mode", "digits"),
+                "side": pt.get("side"),
+                "setup_meta": pt.get("setup_meta") or {},
                 "stake": stake, "status": "open", "profit": None,
                 "t_open": time.time(), "t_close": None,
             }
@@ -1477,7 +1535,7 @@ else:
             return jsonify(error="forbidden"), 403
         if not _supa() or not getattr(_supa(), "enabled", False):
             return jsonify(enabled=False, sessions=[], message="Supabase not configured")
-        at = (request.args.get("account_type") or ACCOUNT_TYPE or "").strip().lower()
+        at = (request.args.get("account_type") or "").strip().lower()
         if at not in ("demo", "real"):
             at = None
         try:
@@ -1493,7 +1551,7 @@ else:
             return jsonify(error="forbidden"), 403
         if not _supa() or not getattr(_supa(), "enabled", False):
             return jsonify(enabled=False, trades=[], message="Supabase not configured")
-        at = (request.args.get("account_type") or ACCOUNT_TYPE or "").strip().lower()
+        at = (request.args.get("account_type") or "").strip().lower()
         if at not in ("demo", "real"):
             at = None
         sid = (request.args.get("session_id") or "").strip() or None
@@ -1518,8 +1576,9 @@ else:
                       request.form.get("skip_filter")))
         if isinstance(skip_filter, str):
             skip_filter = skip_filter.strip().lower() in ("1", "true", "yes", "on")
+        mode = data.get("mode") or request.form.get("mode")
         result = BOT.control(action, symbol=symbol, strategy=strategy,
-                             skip_filter=bool(skip_filter))
+                             skip_filter=bool(skip_filter), mode=mode)
         if action in ("reconnect", "restart_bot", "refresh_limit", "reset_trades", "refresh_trades", "resume"):
             # If the bot thread exited, start it again so trading can continue.
             ensure_bot()

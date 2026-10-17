@@ -143,6 +143,7 @@ class SupabaseStore:
         session_no: int,
         start_balance: float | None,
         currency: str = "USD",
+        strategy_mode: str = "digits",
     ) -> str | None:
         """Insert a new open session; returns session uuid or None."""
         if not self.enabled:
@@ -157,6 +158,7 @@ class SupabaseStore:
             "start_balance": start_balance,
             "currency": currency or "USD",
             "status": "open",
+            "strategy_mode": strategy_mode if strategy_mode in ("digits", "shark") else "digits",
         }
         with self._lock:
             data = self._request(
@@ -261,6 +263,9 @@ class SupabaseStore:
             "trade_no": rec.get("n"),
             "symbol": rec.get("symbol"),
             "strategy": rec.get("strategy"),
+            "strategy_mode": rec.get("strategy_mode") or "digits",
+            "side": rec.get("side"),
+            "setup_meta": rec.get("setup_meta") or {},
             "contract_type": rec.get("contract_type"),
             "barrier": rec.get("barrier"),
             "stake": rec.get("stake"),
@@ -298,6 +303,27 @@ class SupabaseStore:
                 prefer="return=minimal",
             )
 
+
+    def save_shark_signal(self, sig, *, account_type: str, account_id: str | None = None) -> None:
+        if not self.enabled:
+            return
+        row = {
+            "account_type": account_type if account_type in ("demo", "real") else "demo",
+            "account_id": account_id,
+            "session_id": self.current_session_id,
+            "symbol": getattr(sig, "symbol", None),
+            "side": getattr(sig, "side", None),
+            "entry_price": getattr(sig, "entry", None),
+            "stop_loss": getattr(sig, "sl", None),
+            "take_profit_1": getattr(sig, "tp1", None),
+            "take_profit_2": getattr(sig, "tp2", None),
+            "confidence": getattr(sig, "confidence", None),
+            "reason": getattr(sig, "reason", None),
+            "meta": getattr(sig, "meta", {}) or {},
+            "traded": False,
+        }
+        with self._lock:
+            self._request("POST", "shark_signals", row, prefer="return=minimal")
 
     def list_sessions(self, *, account_type: str | None = None, limit: int = 30) -> list:
         if not self.enabled:

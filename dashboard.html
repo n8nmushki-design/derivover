@@ -364,6 +364,7 @@ applyPrivacy();
 
 var key=localStorage.getItem("derivover_key")||"";
 var needKey=false,S=null,lastOk=0,failures=0,showAll=false,evFilter="all",tradeFilter="all",marketFilter="all",tradeQuery="",manualStrategy="auto",autoScrollLogs=true,bootAt=Date.now();
+var histSessions=[],histTrades=[],histEnabled=false,histMsg="",histLoaded=0;
 function money(n){return(Math.round(Number(n)*100)/100).toFixed(2)}
 function num2(n){return(Math.round(Number(n)*100)/100).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
 function signed(n){n=Number(n);return(n>0?"+":"")+money(n)}
@@ -514,6 +515,74 @@ function tradeTable(list){
     return'<tr class="border-b border-outline-variant/15"><td class="py-2.5 pr-3 text-[12px] font-mono text-on-surface-variant">#'+t.n+" "+clock(t.t_open)+'</td><td class="py-2.5 pr-3 text-sm font-medium">'+esc(t.symbol)+'</td><td class="py-2.5 pr-3 text-sm">'+kind+" "+esc(t.barrier)+'</td><td class="py-2.5 pr-3 text-sm text-right font-mono">'+Number(t.stake).toFixed(2)+'</td><td class="py-2.5 pr-3 text-right"><span class="text-[11px] font-semibold px-2 py-0.5 rounded-full '+badge+'">'+res+'</span></td><td class="py-2.5 text-right text-sm font-mono '+sgnClass(t.profit||0)+'">'+(t.profit==null?"—":signed(t.profit))+"</td></tr>"}).join("");
   return'<table class="w-full text-left"><thead><tr class="text-[10px] uppercase text-on-surface-variant font-mono"><th class="pb-2 pr-3">Time</th><th class="pb-2 pr-3">Market</th><th class="pb-2 pr-3">Contract</th><th class="pb-2 pr-3 text-right">Stake</th><th class="pb-2 pr-3 text-right">Result</th><th class="pb-2 text-right">Profit</th></tr></thead><tbody>'+rows+"</tbody></table>";
 }
+
+function loadHistory(){
+  var headers=key?{"X-Status-Key":key}:{};
+  return Promise.all([
+    fetch("/api/history/sessions?limit=30",{headers:headers,cache:"no-store"}).then(function(r){return r.json().catch(function(){return null})}).catch(function(){return null}),
+    fetch("/api/history/trades?limit=50",{headers:headers,cache:"no-store"}).then(function(r){return r.json().catch(function(){return null})}).catch(function(){return null})
+  ]).then(function(pair){
+    var sess=pair[0],tr=pair[1];
+    if(sess){
+      histEnabled=sess.enabled!==false;
+      histMsg=sess.message||sess.error||"";
+      histSessions=Array.isArray(sess.sessions)?sess.sessions:[];
+    }
+    if(tr){
+      if(tr.enabled===false)histEnabled=false;
+      if(tr.message||tr.error)histMsg=tr.message||tr.error||histMsg;
+      histTrades=Array.isArray(tr.trades)?tr.trades:[];
+    }
+    histLoaded=Date.now();
+    try{renderTrades()}catch(err){}
+  });
+}
+function sessionCards(rows){
+  if(!histEnabled&&!(rows&&rows.length)){
+    return '<div class="text-sm text-on-surface-variant p-3 rounded-xl border border-outline-variant/20">No Supabase history yet. Check SUPABASE_URL + SUPABASE_SECRET_KEY and run schema.sql. '+esc(histMsg||"")+"</div>";
+  }
+  if(!rows||!rows.length){
+    return '<div class="text-sm text-on-surface-variant p-3">No saved sessions yet.'+(histMsg?(" "+esc(histMsg)):"")+"</div>";
+  }
+  return rows.map(function(s){
+    var pl=s.session_pl!=null?Number(s.session_pl):null;
+    var plCls=pl==null?"":(pl>=0?"text-emerald-400":"text-error");
+    var plTxt=pl==null?"—":((pl>=0?"+":"")+pl.toFixed(2));
+    var start=s.started_at?new Date(s.started_at).toLocaleString():"—";
+    var end=s.ended_at?new Date(s.ended_at).toLocaleString():"open";
+    var badge=s.account_type==="real"?"bg-error/20 text-error":"bg-primary/20 text-primary";
+    var mode=s.strategy_mode||"digits";
+    return '<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-3 space-y-1">'+
+      '<div class="flex items-center justify-between gap-2">'+
+        '<span class="text-[10px] font-mono uppercase px-2 py-0.5 rounded-full '+badge+'">'+esc(s.account_type||"?")+' · '+esc(mode)+'</span>'+
+        '<span class="text-[10px] text-on-surface-variant">'+esc(s.status||"")+(s.stop_reason?(" · "+esc(s.stop_reason)):"")+'</span>'+
+      '</div>'+
+      '<div class="flex justify-between items-baseline"><span class="text-xs text-on-surface-variant">Session P/L</span><span class="text-lg font-semibold '+plCls+'">'+plTxt+'</span></div>'+
+      '<div class="text-[11px] text-on-surface-variant">Start '+esc(start)+'</div>'+
+      '<div class="text-[11px] text-on-surface-variant">End '+esc(end)+'</div>'+
+      '<div class="text-[11px] text-on-surface-variant">'+(s.wins!=null?s.wins:0)+'W / '+(s.losses!=null?s.losses:0)+'L · trades '+(s.trades_count!=null?s.trades_count:0)+'</div>'+
+    '</div>';
+  }).join("");
+}
+function histTradeTable(rows){
+  if(!rows||!rows.length)return '<div class="text-sm text-on-surface-variant p-2">No saved trades in Supabase yet.</div>';
+  var head='<div class="grid grid-cols-12 gap-1 text-[10px] font-mono uppercase text-on-surface-variant px-1 mb-1"><div class="col-span-2">Acct</div><div class="col-span-2">Symbol</div><div class="col-span-2">Mode</div><div class="col-span-2">Stake</div><div class="col-span-2">P/L</div><div class="col-span-2">Status</div></div>';
+  var body=rows.map(function(t){
+    var pl=t.profit!=null?Number(t.profit):null;
+    var plCls=pl==null?"":(pl>=0?"text-emerald-400":"text-error");
+    var plTxt=pl==null?"—":((pl>=0?"+":"")+pl.toFixed(2));
+    return '<div class="grid grid-cols-12 gap-1 text-xs px-1 py-1.5 border-b border-outline-variant/10">'+
+      '<div class="col-span-2 font-mono">'+esc(t.account_type||"")+'</div>'+
+      '<div class="col-span-2">'+esc(t.symbol||"")+'</div>'+
+      '<div class="col-span-2">'+esc(t.strategy_mode||t.strategy||"")+'</div>'+
+      '<div class="col-span-2">'+esc(t.stake!=null?Number(t.stake).toFixed(2):"—")+'</div>'+
+      '<div class="col-span-2 '+plCls+'">'+plTxt+'</div>'+
+      '<div class="col-span-2">'+esc(t.status||"")+'</div>'+
+    '</div>';
+  }).join("");
+  return head+body;
+}
+
 function renderTrades(){
   var all=S.trades||[];
   var q=(tradeQuery||"").trim().toUpperCase();
@@ -538,7 +607,25 @@ function renderTrades(){
 }
 
 function strategyCards(){return(S.strategies||[]).map(function(s){var cur=s.barrier_idx,b=s.barriers;var chips=b.map(function(v,i){return'<span class="chip'+(i===cur?" cur":i<cur?" past":"")+'">'+v+"</span>"}).join("");var next=cur<b.length-1?"After a loss moves to "+b[cur+1]+".":"After a loss resets to "+b[0]+".";return'<div class="rounded-lg bg-surface-container-low p-4 border border-outline-variant/15"><div class="text-[10px] font-mono uppercase text-on-surface-variant mb-1">'+esc(s.label)+' engine</div><div class="text-lg font-semibold mb-2">'+esc(s.kind)+" "+s.barrier+'</div><div class="flex flex-wrap gap-1 mb-2">'+chips+'</div><p class="text-[12px] text-on-surface-variant">'+esc(next)+" A win returns to "+b[0]+".</p></div>"}).join("")}
-function renderStrategy(){$("strategyBody").innerHTML=strategyCards();$("dashStrategy").innerHTML=strategyCards();if(S.limits){$("riskLimits").innerHTML=[["Stake",money(S.limits.stake)],["Stop-loss","−"+money(S.limits.stop_loss)],["Take-profit","+"+money(S.limits.take_profit)],["Max trades",String(S.limits.max_trades)]].map(function(x){return'<div class="rounded-lg bg-surface-container-low p-3 border border-outline-variant/15"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+x[0]+'</div><div class="text-base font-semibold mt-0.5">'+x[1]+"</div></div>"}).join("")}}
+function renderStrategy(){
+  var mode=(S&&S.strategy_mode)||"digits";
+  var shark=S&&S.shark?S.shark:{};
+  var modeBar='<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-4 mb-4">'+
+    '<div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Active strategy mode</div>'+
+    '<div class="flex flex-wrap gap-2">'+
+      '<button type="button" data-action="set_mode" data-mode="digits" class="ctrl-btn px-4 py-2 rounded-lg text-xs font-semibold border '+(mode==="digits"?"bg-primary-container text-on-primary border-primary":"border-outline-variant/40")+'">Digits Over/Under</button>'+
+      '<button type="button" data-action="set_mode" data-mode="shark" class="ctrl-btn px-4 py-2 rounded-lg text-xs font-semibold border '+(mode==="shark"?"bg-primary-container text-on-primary border-primary":"border-outline-variant/40")+'">Structure + OB + Shark</button>'+
+    '</div>'+
+    '<p class="text-[11px] text-on-surface-variant mt-2">'+(mode==="shark"?("Shark "+esc(shark.symbol||"R_75")+" · "+esc(shark.reason||"…")+" · bars "+(shark.bars||0)):"Dual digit scanner: Over 0 + Under 9")+'</p></div>';
+  $("strategyBody").innerHTML=modeBar+strategyCards();
+  $("dashStrategy").innerHTML=modeBar+strategyCards();
+  if(S.limits){
+    $("riskLimits").innerHTML=[["Stake",money(S.limits.stake)],["Stop-loss","−"+money(S.limits.stop_loss)],["Take-profit","+"+money(S.limits.take_profit)],["Max trades",String(S.limits.max_trades)],["Mode",String(mode)]].map(function(x){
+      return '<div class="rounded-lg bg-surface-container-low p-3 border border-outline-variant/15"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+x[0]+'</div><div class="text-base font-semibold mt-0.5">'+x[1]+"</div></div>";
+    }).join("");
+  }
+}
+
 function renderEvents(){var ev=(S.events||[]).filter(function(e){return evFilter==="all"||e.level==="error"});function row(e){var name=e.level==="error"?"Error":e.level==="warn"?"Warn":"Info";var col=e.level==="error"?"text-error":e.level==="warn"?"text-primary":"text-primary";return'<div class="flex gap-3 py-2 border-b border-outline-variant/10 text-[12px]"><span class="font-mono text-on-surface-variant shrink-0 w-16">'+clock(e.t)+'</span><span class="font-semibold shrink-0 w-12 '+col+'">'+name+'</span><span class="break-words">'+esc(e.msg)+"</span></div>"}
 var list=$("evlist");
 if(!ev.length){list.innerHTML='<p class="text-sm text-on-surface-variant py-4">'+(evFilter==="all"?"Nothing yet.":"No errors.")+"</p>";$("dashEvents").innerHTML='<p class="text-on-surface-variant">No events yet.</p>'}
@@ -596,7 +683,7 @@ function sendControl(action, extra){
   if(action==="reset_stats"&&!confirm("Reset session stats and P/L baseline?"))return;
   var headers={"Content-Type":"application/json","Accept":"application/json"};
   if(key)headers["X-Status-Key"]=key;
-  var body=Object.assign({action:action},extra);
+  var body=Object.assign({action:action},extra); if(extra&&extra.mode)body.mode=extra.mode;
   setCtrlMsg("Sending "+action+"…",true);
   document.querySelectorAll("[data-action],#btnManual,#manualConfirm").forEach(function(b){b.disabled=true});
   fetch("/api/control",{method:"POST",headers:headers,body:JSON.stringify(body),cache:"no-store"})
@@ -639,7 +726,10 @@ document.addEventListener("click",function(e){
   if(act){
     e.preventDefault();
     e.stopPropagation();
-    sendControl(act.getAttribute("data-action"));
+    var a=act.getAttribute("data-action");
+    var extra={};
+    if(act.getAttribute("data-mode"))extra.mode=act.getAttribute("data-mode");
+    sendControl(a, extra);
     return;
   }
 
