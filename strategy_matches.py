@@ -33,8 +33,8 @@ class MatchSignal:
 class MatchEngine:
     def __init__(
         self,
-        window: int = 80,
-        min_ticks: int = 40,
+        window: int = 60,
+        min_ticks: int = 25,
         both: bool = True,
         symbols: Tuple[str, ...] = MATCH_SYMBOLS,
     ):
@@ -82,7 +82,7 @@ class MatchEngine:
 
         # Need a mild edge to trade
         signals: List[MatchSignal] = []
-        if hot_edge >= 0.03:
+        if hot_edge >= 0.02:
             signals.append(
                 MatchSignal(
                     symbol=symbol,
@@ -94,7 +94,7 @@ class MatchEngine:
                     meta={"freq": hot_f, "edge": hot_edge, "window": n},
                 )
             )
-        if self.both and cold_edge >= 0.03:
+        if self.both and cold_edge >= 0.02:
             signals.append(
                 MatchSignal(
                     symbol=symbol,

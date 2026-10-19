@@ -999,14 +999,24 @@ class Bot:
             with self.lock:
                 self.active_strategies = chosen
                 self.strategy_mode = chosen[0]
-                for m in chosen:
-                    self.strategy_stopped[m] = False
+                # Clear stop flags for selected strategies; leave others as-is
+                for m in STRATEGY_MODES:
+                    if m in chosen:
+                        self.strategy_stopped[m] = False
                 if "shark" in chosen:
                     self.ensure_shark()
                 if "matches" in chosen:
-                    self.ensure_matches()
+                    eng = self.ensure_matches()
+                    if eng is None:
+                        return {"ok": False, "message": "Matches engine unavailable – deploy strategy_matches.py"}
                 if "nextdigit" in chosen:
-                    self.ensure_nextdigit()
+                    eng = self.ensure_nextdigit()
+                    if eng is None:
+                        return {"ok": False, "message": "NextDigit engine unavailable – deploy strategy_nextdigit.py"}
+            try:
+                self._supa_sync_strategy_budgets()
+            except Exception:
+                pass
             self.note("info", "Active strategies → " + ",".join(chosen))
             return {"ok": True, "message": "Active: " + ",".join(chosen)}
         if action in ("set_mode", "strategy_mode", "set_strategy"):
@@ -1450,20 +1460,18 @@ class Bot:
             self.manual_symbol = None
             self.manual_strategy = None
             self.manual_skip_filter = False
-            ws.send(json.dumps({
-                "buy": 1,
-                "price": STAKE,
-                "parameters": {
-                    "amount": STAKE,
-                    "basis": "stake",
-                    "contract_type": ctype,
-                    "currency": self.currency,
-                    "duration": 1,
-                    "duration_unit": "t",
-                    "underlying_symbol": symbol,
-                    "barrier": barrier,
-                },
-            }))
+            params = {
+                "amount": STAKE,
+                "basis": "stake",
+                "contract_type": ctype,
+                "currency": self.currency or "USD",
+                "duration": 1,
+                "duration_unit": "t",
+                "symbol": symbol,
+                "underlying_symbol": symbol,
+                "barrier": str(barrier),
+            }
+            ws.send(json.dumps({"buy": 1, "price": STAKE, "parameters": params}))
             return
 
         # ---- Next digit prediction (DIGITMATCH) ----
@@ -1492,20 +1500,18 @@ class Bot:
             self.manual_symbol = None
             self.manual_strategy = None
             self.manual_skip_filter = False
-            ws.send(json.dumps({
-                "buy": 1,
-                "price": STAKE,
-                "parameters": {
-                    "amount": STAKE,
-                    "basis": "stake",
-                    "contract_type": ctype,
-                    "currency": self.currency,
-                    "duration": 1,
-                    "duration_unit": "t",
-                    "underlying_symbol": symbol,
-                    "barrier": barrier,
-                },
-            }))
+            params = {
+                "amount": STAKE,
+                "basis": "stake",
+                "contract_type": ctype,
+                "currency": self.currency or "USD",
+                "duration": 1,
+                "duration_unit": "t",
+                "symbol": symbol,
+                "underlying_symbol": symbol,
+                "barrier": str(barrier),
+            }
+            ws.send(json.dumps({"buy": 1, "price": STAKE, "parameters": params}))
             return
 
         s       = STRATEGIES[key]
@@ -1706,28 +1712,27 @@ class Bot:
                 ph.append([round(time.time(), 2), float(price)])
             except Exception:
                 pass
-            if bot_strategy_active(self, "matches"):
-                meng = self.ensure_matches()
-                if meng is not None:
-                    try:
-                        sigs = meng.on_digit(symbol, digit)
-                        self.matches_status = meng.status()
-                        if sigs:
-                            self._pending_match_signals = list(sigs)
-                            self.note("info", f"Matches: {sigs[0].reason}")
-                    except Exception as e:
-                        print(f"[matches] on_digit: {e}", flush=True)
-            if bot_strategy_active(self, "nextdigit"):
-                neng = self.ensure_nextdigit()
-                if neng is not None:
-                    try:
-                        nsig = neng.on_digit(symbol, digit)
-                        self.nextdigit_status = neng.status()
-                        if nsig:
-                            self._pending_nextdigit_signal = nsig
-                            self.note("info", f"NextDigit: {nsig.reason}")
-                    except Exception as e:
-                        print(f"[nextdigit] on_digit: {e}", flush=True)
+            # Always update digit engines so Strategy UI can show heat/predictions
+            meng = self.ensure_matches()
+            if meng is not None:
+                try:
+                    sigs = meng.on_digit(symbol, digit)
+                    self.matches_status = meng.status()
+                    if sigs and bot_strategy_active(self, "matches"):
+                        self._pending_match_signals = list(sigs)
+                        self.note("info", f"Matches: {sigs[0].reason}")
+                except Exception as e:
+                    print(f"[matches] on_digit: {e}", flush=True)
+            neng = self.ensure_nextdigit()
+            if neng is not None:
+                try:
+                    nsig = neng.on_digit(symbol, digit)
+                    self.nextdigit_status = neng.status()
+                    if nsig and bot_strategy_active(self, "nextdigit"):
+                        self._pending_nextdigit_signal = nsig
+                        self.note("info", f"NextDigit: {nsig.reason}")
+                except Exception as e:
+                    print(f"[nextdigit] on_digit: {e}", flush=True)
             self.last_price[symbol] = price
             self.ticks_seen += 1
 

@@ -908,9 +908,12 @@ function renderStrategyPage(){
     return '<div class="rounded-xl border border-white/5 bg-black/20 p-2.5"><div class="text-[10px] uppercase tracking-wide text-on-surface-variant">'+label+'</div><div class="text-sm font-semibold mt-0.5 '+(cls||"")+'">'+val+'</div></div>';
   }
   function budgetHtml(c){
+    c=c||{};
     var p=Number(c.pnl||0);
     var st=c.stopped?"Stopped (budget)":(c.active?"Active":"Off");
-    return '<div class="flex flex-wrap gap-3 text-[12px]"><span>Allocated <b class="text-emerald-300">$'+Number(c.budget).toFixed(0)+'</b></span><span>Left <b>$'+Number(c.left).toFixed(0)+'</b></span><span class="'+(p>=0?"text-emerald-400":"text-error")+'">P/L '+(p>=0?"+":"")+p.toFixed(2)+'</span><span>Trades '+c.trades+'</span><span class="text-on-surface-variant">'+st+'</span></div>';
+    var b=Number(c.budget!=null?c.budget:100);
+    var left=Number(c.left!=null?c.left:b);
+    return '<div class="flex flex-wrap gap-3 text-[12px]"><span>Allocated <b class="text-emerald-300">$'+b.toFixed(0)+'</b></span><span>Left <b>$'+left.toFixed(0)+'</b></span><span class="'+(p>=0?"text-emerald-400":"text-error")+'">P/L '+(p>=0?"+":"")+p.toFixed(2)+'</span><span>Trades '+(c.trades||0)+'</span><span class="text-on-surface-variant">'+st+'</span></div>';
   }
   function fillStats(id, m, colorCls){
     var el=$(id); if(!el)return;
@@ -938,10 +941,15 @@ function renderStrategyPage(){
   var mbody=$("miniMatchesBody");
   if(mbody){
     var by=match.by_symbol||{};
-    var lines=Object.keys(by).slice(0,4).map(function(sym){
-      var s=by[sym]; return sym+": ticks "+(s.ticks||0)+(s.ready?(" · hot "+s.hot+" / cold "+s.cold):" collecting");
+    var keys=Object.keys(by);
+    var lines=keys.slice(0,6).map(function(sym){
+      var s=by[sym]||{};
+      return '<div class="flex justify-between gap-2 border-b border-white/5 py-1"><span class="font-mono text-violet-200/90">'+sym+'</span><span>'+(s.ready?("hot <b>"+s.hot+"</b> / cold <b>"+s.cold+"</b> · n="+s.ticks):("collecting "+(s.ticks||0)+"/25"))+'</span></div>';
     });
-    mbody.innerHTML=(match.reason||"Collecting digits…")+(lines.length?"<br>"+lines.join("<br>"):"");
+    var active=(S.active_strategies||[]).indexOf("matches")>=0;
+    var head=match.reason||(keys.length?"Scanning…":"Waiting for ticks on V10/V100…");
+    if(!active) head = "Matches not active — tap Solo run. Still collecting ticks in background.";
+    mbody.innerHTML='<div class="mb-2 text-on-surface-variant">'+head+'</div>'+(lines.length?lines.join(""):'<div class="text-on-surface-variant">No digit samples yet — stay Connected a few seconds.</div>');
   }
   var nd=S.nextdigit||{};
   var nbody=$("miniNextBody");
