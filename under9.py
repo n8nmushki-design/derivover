@@ -341,6 +341,173 @@ class Bot:
         self.limit_hit_at = None                     # set only when MAX_TRADES is hit
         self.limit_refresh_count = 0                 # how many times limit was refreshed
 
+
+    def fetch_v75_history(self, years: float = 1.0, symbols=None, granularities=None) -> dict:
+        """
+        Manual backfill: pull ~1y of V75 OHLC from Deriv (paginated) into
+        memory + Supabase. Runs in a background thread.
+        """
+        if self.history_job and self.history_job.get("status") == "running":
+            return {"ok": False, "message": "History load already running"}
+        symbols = list(symbols or globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"]))
+        granularities = list(granularities or [300, 900, 3600])
+        self.history_job = {
+            "status": "running",
+            "progress": 0,
+            "message": "Starting V75 history load…",
+            "saved": 0,
+        }
+
+        def worker():
+            import math
+            try:
+                now = int(time.time())
+                start_floor = now - int(years * 365.25 * 24 * 3600)
+                total_steps = max(1, len(symbols) * len(granularities) * 8)
+                step = 0
+                saved = 0
+                # Always use a dedicated socket (never share bot._ws — recv race)
+                try:
+                    url = get_ws_url()
+                    ws = create_connection(url, timeout=25, header=["User-Agent: " + UA])
+                    ws.settimeout(25)
+                    own_ws = True
+                except Exception as e:
+                    self.history_job = {
+                        "status": "error",
+                        "progress": 0,
+                        "message": f"Cannot open WebSocket: {e}",
+                        "saved": 0,
+                    }
+                    return
+
+                BATCH = 2000  # Deriv-safe page size
+                if not hasattr(self, "v75_candles") or self.v75_candles is None:
+                    self.v75_candles = {}
+
+                for sym in symbols:
+                    for gran in granularities:
+                        end = now
+                        series = []
+                        pages = 0
+                        max_pages = 40  # safety cap
+                        while end > start_floor and pages < max_pages:
+                            req = {
+                                "ticks_history": sym,
+                                "adjust_start_time": 1,
+                                "count": BATCH,
+                                "end": end,
+                                "granularity": int(gran),
+                                "style": "candles",
+                            }
+                            try:
+                                ws.send(json.dumps(req))
+                                raw = ws.recv()
+                                msg = json.loads(raw)
+                            except Exception as e:
+                                self.history_job = {
+                                    "status": "error",
+                                    "progress": int(100 * step / total_steps),
+                                    "message": f"WS error {sym}/{gran}: {e}",
+                                    "saved": saved,
+                                }
+                                if own_ws:
+                                    try:
+                                        ws.close()
+                                    except Exception:
+                                        pass
+                                return
+                            if "error" in msg:
+                                # stop this series, continue others
+                                break
+                            rows = msg.get("candles") or []
+                            if not rows:
+                                break
+                            cleaned = []
+                            for r in rows:
+                                try:
+                                    cleaned.append({
+                                        "t": int(r.get("epoch") or r.get("t") or 0),
+                                        "o": float(r.get("open", r.get("o"))),
+                                        "h": float(r.get("high", r.get("h"))),
+                                        "l": float(r.get("low", r.get("l"))),
+                                        "c": float(r.get("close", r.get("c"))),
+                                    })
+                                except (TypeError, ValueError, KeyError):
+                                    continue
+                            if not cleaned:
+                                break
+                            series = cleaned + series
+                            # next page ends before oldest candle
+                            oldest = min(c["t"] for c in cleaned)
+                            if oldest <= start_floor:
+                                break
+                            end = oldest - int(gran)
+                            pages += 1
+                            step += 1
+                            self.history_job = {
+                                "status": "running",
+                                "progress": min(99, int(100 * step / total_steps)),
+                                "message": f"Loading {sym} {gran}s page {pages} ({len(series)} bars)…",
+                                "saved": saved,
+                            }
+                            # Persist page to Supabase
+                            try:
+                                store = _supa()
+                                if store and hasattr(store, "save_candles"):
+                                    store.save_candles(
+                                        symbol=sym,
+                                        granularity=int(gran),
+                                        rows=cleaned,
+                                        account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                                    )
+                                    saved += len(cleaned)
+                            except Exception:
+                                pass
+                            time.sleep(0.15)
+
+                        # dedupe + sort, keep generous history in memory for chart
+                        by_t = {c["t"]: c for c in series if c["t"] >= start_floor}
+                        ordered = [by_t[k] for k in sorted(by_t.keys())]
+                        self.v75_candles.setdefault(sym, {})[str(int(gran))] = ordered[-8000:]
+                        # Feed shark engine for primary symbol
+                        if sym == SHARK_SYMBOL:
+                            eng = self.ensure_shark()
+                            if eng is not None:
+                                eng.set_candles(int(gran), ordered[-200:])
+                                self.shark_status = eng.status()
+                        step += 1
+                        self.history_job = {
+                            "status": "running",
+                            "progress": min(99, int(100 * step / total_steps)),
+                            "message": f"Done {sym} {gran}s → {len(ordered)} bars",
+                            "saved": saved,
+                        }
+
+                if own_ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                self.history_job = {
+                    "status": "done",
+                    "progress": 100,
+                    "message": f"V75 history loaded (~{years}y). Saved ~{saved} candle rows.",
+                    "saved": saved,
+                }
+                self.note("info", self.history_job["message"])
+            except Exception as e:
+                self.history_job = {
+                    "status": "error",
+                    "progress": 0,
+                    "message": f"History load failed: {e}",
+                    "saved": 0,
+                }
+                self.note("error", str(e))
+
+        threading.Thread(target=worker, name="v75-history", daemon=True).start()
+        return {"ok": True, "message": "V75 history load started (up to ~1 year)"}
+
     def ensure_shark(self):
         """Return SharkEngine instance or None (never raises NameError)."""
         eng = getattr(self, "shark", None)
@@ -584,6 +751,14 @@ class Bot:
             self.reconnect_requested = True
             self.note("info", f"Strategy started ({mode})")
             return {"ok": True, "message": f"Started {mode} strategy"}
+        if action in ("fetch_v75_history", "load_history", "load_v75", "backfill_candles"):
+            years = kwargs.get("years", 1)
+            try:
+                years = float(years)
+            except (TypeError, ValueError):
+                years = 1.0
+            years = max(0.1, min(years, 2.0))
+            return self.fetch_v75_history(years=years)
         if action in ("set_chart_symbol", "chart_symbol"):
             sym = (kwargs.get("symbol") or kwargs.get("mode") or "").strip()
             v75 = list(globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"]))
@@ -789,6 +964,7 @@ class Bot:
                     "last_error": getattr(_supa(), "last_error", None) if _supa() else None,
                 },
                 "strategy_mode": getattr(self, "strategy_mode", DEFAULT_STRATEGY_MODE),
+                "history_job": getattr(self, "history_job", None),
                 "shark": (getattr(self, "shark").status() if getattr(self, "shark", None) else {"reason": "unavailable"}),
                 "chart": {
                     "symbol": getattr(self, "chart_symbol", None) or SHARK_SYMBOL,

@@ -101,6 +101,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
   #modeBanner { display:none; }
   body.mode-shark #modeBanner { display:block; }
     body.mode-digits .shark-only, body.mode-digits #sharkDashPanel { display: none !important; }
+  #sharkChartBox.expanded{height:70vh!important;min-height:420px}
+  .lw-label{font-size:10px}
+
   body.mode-shark .digits-only { display: none !important; }
   body.mode-shark #sharkDashPanel { display: block; }
   body.mode-digits #sharkDashPanel { display: none !important; }
@@ -116,6 +119,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
   }
 </style>
 
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body class="mode-shark min-h-screen antialiased">
 
@@ -264,14 +268,22 @@ button:disabled{opacity:.45;cursor:not-allowed}
       <button type="button" data-action="reconnect" class="ctrl-btn px-3 py-2 rounded-xl text-xs font-semibold border border-outline-variant/40">Reconnect</button>
     </div>
     <div class="shark-card rounded-xl p-3 lg:p-4">
-      <div class="flex items-center justify-between mb-2">
+      <div class="flex items-start justify-between gap-2 mb-2 flex-wrap">
         <div>
-          <div class="text-[10px] font-mono uppercase" style="color:#00E5FF">Live chart · Deriv ticks</div>
+          <div class="text-[10px] font-mono uppercase" style="color:#00E5FF">Professional chart · V75</div>
           <div class="text-sm font-semibold" id="chartTitle">R_75</div>
+          <div class="text-[11px] text-on-surface-variant" id="chartStatus">Waiting for candles…</div>
         </div>
         <div class="text-right">
-          <div class="text-lg font-semibold" id="chartPrice">—</div>
-          <div class="text-[11px] text-on-surface-variant" id="chartStatus">Waiting for ticks…</div>
+          <div class="text-xl font-semibold tracking-tight" id="chartPrice">—</div>
+          <div class="flex flex-wrap gap-1.5 justify-end mt-1">
+            <button type="button" id="btnLoadHist" data-action="fetch_v75_history" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-cyan-400/40" style="color:#00E5FF">Load 1Y history</button>
+            <button type="button" id="btnOverlay" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Overlays on</button>
+            <button type="button" id="btnZoomIn" class="px-2 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">+</button>
+            <button type="button" id="btnZoomOut" class="px-2 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">−</button>
+            <button type="button" id="btnZoomReset" class="px-2 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Reset</button>
+            <button type="button" id="btnChartExpand" class="px-2 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Expand</button>
+          </div>
         </div>
       </div>
       <div class="flex flex-wrap items-center gap-2 mb-2">
@@ -286,15 +298,16 @@ button:disabled{opacity:.45;cursor:not-allowed}
           <button type="button" data-chart-tf="3600" class="tf-btn px-3 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">1H Bias</button>
         </div>
       </div>
-      <div class="text-[10px] text-on-surface-variant mb-2">Shark stack: <b style="color:#00E5FF">1H BOS</b> → <b style="color:#FFB020">15M OB zone</b> → <b style="color:#A78BFA">5M 0.886 entry</b> · Fibonacci TP1 0.5 / TP2 0.886</div>
-      <canvas id="sharkChart" height="260" class="w-full rounded-lg bg-black/30"></canvas>
+      <div id="histProgress" class="hidden text-[11px] mb-2 px-2 py-1.5 rounded-lg border border-cyan-400/20 bg-black/20" style="color:#00E5FF"></div>
+      <div id="sharkChartBox" class="relative w-full rounded-xl overflow-hidden border border-white/5 bg-black/40" style="height:340px">
+        <div id="sharkChart" class="w-full h-full"></div>
+      </div>
       <div class="flex flex-wrap gap-3 mt-2 text-[10px] font-mono text-on-surface-variant">
-        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#26a69a"></i>Bull candle</span>
-        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#ef5350"></i>Bear candle</span>
-        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#FFB020"></i>0.5 mid</span>
+        <span>Scroll / pinch to zoom · drag to pan</span>
         <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#A78BFA"></i>0.886</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#FFB020"></i>0.5</span>
         <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#34D399"></i>OB</span>
-        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#22c55e"></i>TP1/TP2</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#22c55e"></i>TP</span>
         <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#f43f5e"></i>SL</span>
       </div>
       <div id="liveTargets" class="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3"></div>
@@ -834,8 +847,15 @@ function renderOverview(){
 
 
 
+
 var chartTf = "300";
 var chartSym = "R_75";
+var showOverlays = true;
+var lwChart = null;
+var lwSeries = null;
+var lwPriceLines = [];
+var chartExpanded = false;
+
 function setChartTf(tf){
   chartTf = String(tf||"300");
   document.querySelectorAll(".tf-btn").forEach(function(b){
@@ -844,7 +864,7 @@ function setChartTf(tf){
     b.classList.toggle("border-cyan-400/50", on);
     b.classList.toggle("border-outline-variant/40", !on);
   });
-  drawSharkChart();
+  drawSharkChart(true);
 }
 function setChartSym(sym){
   chartSym = String(sym||"R_75");
@@ -854,25 +874,74 @@ function setChartSym(sym){
     b.classList.toggle("border-cyan-400/50", on);
     b.classList.toggle("border-outline-variant/40", !on);
   });
-  drawSharkChart();
+  drawSharkChart(true);
 }
-function drawSharkChart(){
-  var canvas=$("sharkChart");
-  if(!canvas||!S)return;
-  var ctx=canvas.getContext("2d");
-  var dpr=window.devicePixelRatio||1;
-  var rect=canvas.getBoundingClientRect();
-  var w=Math.max(280,Math.floor(rect.width||320));
-  var h=280;
-  canvas.width=w*dpr; canvas.height=h*dpr;
-  ctx.setTransform(dpr,0,0,dpr,0,0);
-  ctx.clearRect(0,0,w,h);
-
+function ensureLwChart(){
+  var el = $("sharkChart");
+  if(!el || typeof LightweightCharts === "undefined") return null;
+  if(lwChart) return lwChart;
+  lwChart = LightweightCharts.createChart(el, {
+    autoSize: true,
+    layout: {
+      background: { type: "solid", color: "transparent" },
+      textColor: "#94a3b8",
+      fontSize: 11,
+    },
+    grid: {
+      vertLines: { color: "rgba(148,163,184,0.08)" },
+      horzLines: { color: "rgba(148,163,184,0.08)" },
+    },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: {
+      borderColor: "rgba(148,163,184,0.15)",
+      scaleMargins: { top: 0.12, bottom: 0.12 },
+    },
+    timeScale: {
+      borderColor: "rgba(148,163,184,0.15)",
+      timeVisible: true,
+      secondsVisible: false,
+    },
+    handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+    handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
+  });
+  lwSeries = lwChart.addCandlestickSeries({
+    upColor: "#26a69a",
+    downColor: "#ef5350",
+    borderUpColor: "#26a69a",
+    borderDownColor: "#ef5350",
+    wickUpColor: "#26a69a",
+    wickDownColor: "#ef5350",
+  });
+  window.addEventListener("resize", function(){
+    if(lwChart) lwChart.timeScale().fitContent();
+  });
+  return lwChart;
+}
+function clearPriceLines(){
+  if(!lwSeries) return;
+  lwPriceLines.forEach(function(pl){
+    try { lwSeries.removePriceLine(pl); } catch(e){}
+  });
+  lwPriceLines = [];
+}
+function addPL(price, color, title){
+  if(!lwSeries || price==null || !isFinite(Number(price))) return;
+  var pl = lwSeries.createPriceLine({
+    price: Number(price),
+    color: color,
+    lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title: title,
+  });
+  lwPriceLines.push(pl);
+}
+function drawSharkChart(resetView){
+  if(!S) return;
   var shark=S.shark||{};
   var chart=S.chart||{};
   var levels=Object.assign({}, shark.levels||{}, chart.levels||{});
   var targets=Object.assign({}, shark.targets||{}, chart.targets||{});
-  // Prefer per-symbol V75 candle store, fall back to engine candles
   var v75 = chart.v75_candles || {};
   var symPack = v75[chartSym] || {};
   var rows = symPack[chartTf] || symPack[String(chartTf)] || [];
@@ -880,102 +949,90 @@ function drawSharkChart(){
     var allC = (shark.candles||chart.candles||{});
     rows = allC[chartTf] || allC[String(chartTf)] || [];
   }
-
   var tfName = {300:"5M Entry",900:"15M Setup",3600:"1H Bias"}[chartTf]||chartTf;
-  $("chartTitle").textContent = chartSym + " · " + tfName + " · V75";
-  var cnt = shark.counts || {};
-  var n5 = (v75[chartSym]&&v75[chartSym]["300"]||[]).length || cnt["5m"] || 0;
-  var n15 = (v75[chartSym]&&v75[chartSym]["900"]||[]).length || cnt["15m"] || 0;
-  var n1h = (v75[chartSym]&&v75[chartSym]["3600"]||[]).length || cnt["1h"] || 0;
-  $("chartStatus").textContent = (shark.reason||"Building multi-TF…") + " · 5M:"+n5+" 15M:"+n15+" 1H:"+n1h;
+  $("chartTitle").textContent = chartSym + " · " + tfName;
+  var n5 = (v75[chartSym]&&v75[chartSym]["300"]||[]).length;
+  var n15 = (v75[chartSym]&&v75[chartSym]["900"]||[]).length;
+  var n1h = (v75[chartSym]&&v75[chartSym]["3600"]||[]).length;
+  $("chartStatus").textContent = (n5||n15||n1h)
+    ? ("Bars 5M:"+n5+" · 15M:"+n15+" · 1H:"+n1h+(shark.reason?(" · "+shark.reason):""))
+    : (shark.reason || "No candles yet — tap Load 1Y history");
 
-  if(!rows||!rows.length){
-    ctx.fillStyle="#64748b";
-    ctx.font="12px sans-serif";
-    ctx.fillText("Loading "+chartSym+" candles from Deriv…",12,h/2);
+  // history progress
+  var hj = S.history_job;
+  var hp = $("histProgress");
+  if(hp){
+    if(hj && hj.status==="running"){
+      hp.classList.remove("hidden");
+      hp.textContent = (hj.progress||0)+"% — "+(hj.message||"Loading…");
+    } else if(hj && hj.status==="done"){
+      hp.classList.remove("hidden");
+      hp.textContent = hj.message || "History loaded";
+    } else if(hj && hj.status==="error"){
+      hp.classList.remove("hidden");
+      hp.textContent = "History error: "+(hj.message||"");
+    } else {
+      hp.classList.add("hidden");
+    }
+  }
+
+  if(typeof LightweightCharts === "undefined"){
+    $("chartStatus").textContent = "Chart library failed to load";
+    return;
+  }
+  ensureLwChart();
+  if(!lwSeries) return;
+
+  if(!rows.length){
+    lwSeries.setData([]);
+    clearPriceLines();
     renderLiveTargets(targets, levels);
     renderSharkLevelsPanel(levels, targets, shark);
     return;
   }
 
-  var slice=rows.slice(-70);
-  var lo=Infinity,hi=-Infinity;
-  slice.forEach(function(b){
-    var L=Number(b.l!=null?b.l:b.low), H=Number(b.h!=null?b.h:b.high);
-    if(L<lo)lo=L; if(H>hi)hi=H;
+  // Build OHLC for lightweight-charts (time in seconds)
+  var data = [];
+  var seen = {};
+  rows.forEach(function(b){
+    var t = Number(b.t || b.epoch || 0);
+    if(!t || seen[t]) return;
+    seen[t]=1;
+    var o=Number(b.o!=null?b.o:b.open), h=Number(b.h!=null?b.h:b.high);
+    var l=Number(b.l!=null?b.l:b.low), c=Number(b.c!=null?b.c:b.close);
+    if(!isFinite(o)||!isFinite(h)||!isFinite(l)||!isFinite(c)) return;
+    data.push({time:t, open:o, high:h, low:l, close:c});
   });
-  ["mid","fib_886","ob_lo","ob_hi","tp1","tp2","entry","leg_lo","leg_hi"].forEach(function(k){
-    var v=levels[k]!=null?levels[k]:targets[k];
-    if(v!=null&&isFinite(Number(v))){lo=Math.min(lo,Number(v));hi=Math.max(hi,Number(v));}
-  });
-  if(targets.sl!=null&&isFinite(Number(targets.sl))){lo=Math.min(lo,Number(targets.sl));hi=Math.max(hi,Number(targets.sl));}
-  if(!isFinite(lo)||!isFinite(hi)||hi===lo){hi=(lo||0)+1;lo=(lo||0)-1;}
-  var pad=(hi-lo)*0.08; lo-=pad; hi+=pad;
+  data.sort(function(a,b){return a.time-b.time});
+  // Keep last 3000 for performance
+  if(data.length>3000) data=data.slice(-3000);
+  lwSeries.setData(data);
+  if(resetView) lwChart.timeScale().fitContent();
 
-  function Y(v){return 28+(h-48)*(1-(Number(v)-lo)/(hi-lo));}
-  var n=slice.length;
-  var slot=(w-24)/Math.max(n,1);
-  var cw=Math.max(2, slot*0.62);
+  var last = data[data.length-1];
+  $("chartPrice").textContent = last ? last.close.toFixed(2) : "—";
 
-  // Strategy: Order Block zone
-  if(levels.ob_lo!=null&&levels.ob_hi!=null){
-    var y1=Y(levels.ob_hi), y2=Y(levels.ob_lo);
-    ctx.fillStyle="rgba(52,211,153,0.14)";
-    ctx.fillRect(12,Math.min(y1,y2),w-24,Math.max(2,Math.abs(y2-y1)));
-    ctx.fillStyle="#34D399";
-    ctx.font="10px monospace";
-    ctx.fillText("OB ZONE", 14, Math.min(y1,y2)-4);
-  }
-
-  function hline(val,color,label,dash){
-    if(val==null||!isFinite(Number(val)))return;
-    var y=Y(val);
-    ctx.strokeStyle=color; ctx.lineWidth=1.25;
-    ctx.setLineDash(dash||[]);
-    ctx.beginPath(); ctx.moveTo(12,y); ctx.lineTo(w-12,y); ctx.stroke();
-    ctx.setLineDash([]);
-    if(label){
-      ctx.fillStyle=color; ctx.font="10px monospace";
-      ctx.fillText(label+" "+Number(val).toFixed(2), 14, y-3);
+  // Strategy overlays only when enabled AND chart is primary shark symbol (avoids clutter/wrong scale)
+  clearPriceLines();
+  var primary = (chart.symbol || (S.chart&&S.chart.symbol) || "R_75");
+  // Prefer SHARK from mode; overlays meaningful when levels match chart scale
+  if(showOverlays && data.length){
+    var midP = data[Math.floor(data.length/2)].close;
+    var lvlVals = [levels.mid, levels.fib_886, levels.ob_lo, levels.ob_hi, targets.entry, targets.tp1, targets.tp2, targets.sl]
+      .map(Number).filter(function(x){return isFinite(x)});
+    var near = lvlVals.length && lvlVals.every(function(v){return Math.abs(v-midP)/Math.max(1,Math.abs(midP)) < 0.5});
+    if(near || chartSym === primary){
+      addPL(levels.mid, "#FFB020", "0.5");
+      addPL(levels.fib_886, "#A78BFA", "0.886");
+      addPL(levels.ob_lo, "#34D399", "OB lo");
+      addPL(levels.ob_hi, "#34D399", "OB hi");
+      addPL(targets.entry || levels.entry, "#00F2FE", "Entry");
+      addPL(targets.sl, "#f43f5e", "SL");
+      addPL(targets.tp1 || levels.tp1, "#22c55e", "TP1");
+      addPL(targets.tp2 || levels.tp2, "#4ade80", "TP2");
     }
   }
-  // Shark Fibonacci / structure overlays
-  hline(levels.leg_hi,"#64748b","Swing H",[2,4]);
-  hline(levels.leg_lo,"#64748b","Swing L",[2,4]);
-  hline(levels.mid,"#FFB020","0.5 mid",[4,3]);
-  hline(levels.fib_886,"#A78BFA","Shark 0.886",[2,2]);
-  hline(targets.tp1||levels.tp1,"#22c55e","TP1 0.5",[]);
-  hline(targets.tp2||levels.tp2,"#4ade80","TP2 0.886",[6,3]);
-  hline(targets.sl,"#f43f5e","SL",[]);
-  hline(targets.entry||levels.entry,"#00F2FE","ENTRY",[1,2]);
 
-  // Candlesticks
-  slice.forEach(function(b,idx){
-    var o=Number(b.o!=null?b.o:b.open), c=Number(b.c!=null?b.c:b.close);
-    var bh=Number(b.h!=null?b.h:b.high), bl=Number(b.l!=null?b.l:b.low);
-    var x=12+idx*slot+slot/2;
-    var up=c>=o;
-    var col=up?"#26a69a":"#ef5350";
-    ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(x,Y(bh)); ctx.lineTo(x,Y(bl)); ctx.stroke();
-    var yO=Y(o), yC=Y(c);
-    var top=Math.min(yO,yC), bot=Math.max(yO,yC);
-    ctx.fillRect(x-cw/2, top, cw, Math.max(1, bot-top));
-  });
-
-  // BOS badge
-  if(levels.bos||shark.bias){
-    var bos=String(levels.bos||shark.bias);
-    ctx.fillStyle=bos==="bullish"?"rgba(34,197,94,0.2)":"rgba(244,63,94,0.2)";
-    ctx.fillRect(w-108, 8, 96, 18);
-    ctx.fillStyle=bos==="bullish"?"#22c55e":"#f43f5e";
-    ctx.font="11px monospace";
-    ctx.fillText("BOS "+bos.toUpperCase(), w-100, 21);
-  }
-
-  var last=slice[slice.length-1];
-  var lastC=Number(last.c!=null?last.c:last.close);
-  $("chartPrice").textContent=isFinite(lastC)?lastC.toFixed(2):"—";
   renderLiveTargets(targets, levels);
   renderSharkLevelsPanel(levels, targets, shark);
 }
@@ -1144,6 +1201,40 @@ document.addEventListener("click",function(e){
   if(v75b){
     e.preventDefault();
     setChartSym(v75b.getAttribute("data-v75"));
+    return;
+  }
+
+  if(t.closest("#btnOverlay")){
+    e.preventDefault();
+    showOverlays=!showOverlays;
+    var b=$("btnOverlay");
+    if(b)b.textContent=showOverlays?"Overlays on":"Overlays off";
+    drawSharkChart(false);
+    return;
+  }
+  if(t.closest("#btnZoomIn")){
+    e.preventDefault();
+    if(lwChart){var ts=lwChart.timeScale(); var r=ts.getVisibleLogicalRange(); if(r){var m=(r.to-r.from)*0.2; ts.setVisibleLogicalRange({from:r.from+m,to:r.to-m});}}
+    return;
+  }
+  if(t.closest("#btnZoomOut")){
+    e.preventDefault();
+    if(lwChart){var ts=lwChart.timeScale(); var r=ts.getVisibleLogicalRange(); if(r){var m=(r.to-r.from)*0.25; ts.setVisibleLogicalRange({from:r.from-m,to:r.to+m});}}
+    return;
+  }
+  if(t.closest("#btnZoomReset")){
+    e.preventDefault();
+    if(lwChart) lwChart.timeScale().fitContent();
+    return;
+  }
+  if(t.closest("#btnChartExpand")){
+    e.preventDefault();
+    chartExpanded=!chartExpanded;
+    var box=$("sharkChartBox");
+    if(box) box.classList.toggle("expanded", chartExpanded);
+    var be=$("btnChartExpand");
+    if(be) be.textContent=chartExpanded?"Shrink":"Expand";
+    if(lwChart) setTimeout(function(){lwChart.timeScale().fitContent();},50);
     return;
   }
 
