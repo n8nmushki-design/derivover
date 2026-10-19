@@ -378,6 +378,40 @@ class SupabaseStore:
             ):
                 print("[supabase] shark_signals table missing – run Part 6 SQL in supabase/README.md", flush=True)
 
+    def list_candles(
+        self,
+        *,
+        symbol: str,
+        granularity: int,
+        limit: int = 5000,
+        account_type: str | None = None,
+    ) -> list:
+        """Load OHLC rows newest-first then return chronological."""
+        if not self.enabled:
+            return []
+        path = (
+            f"ohlc_candles?symbol=eq.{symbol}&granularity=eq.{int(granularity)}"
+            f"&order=epoch.desc&limit={int(limit)}"
+        )
+        if account_type in ("demo", "real"):
+            path += f"&account_type=eq.{account_type}"
+        data = self._request("GET", path)
+        if not isinstance(data, list):
+            return []
+        out = []
+        for r in reversed(data):
+            try:
+                out.append({
+                    "t": int(r["epoch"]),
+                    "o": float(r["open"]),
+                    "h": float(r["high"]),
+                    "l": float(r["low"]),
+                    "c": float(r["close"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
     def list_sessions(self, *, account_type: str | None = None, limit: int = 30) -> list:
         if not self.enabled:
             return []

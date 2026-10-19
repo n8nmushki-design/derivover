@@ -132,6 +132,32 @@ STRATEGIES = {
 def clean(s: str) -> str:
     return "".join(c for c in s if 33 <= ord(c) <= 126)
 
+def normalize_candle_rows(rows, granularity=None):
+    """Clean OHLC rows: seconds epoch, valid OHLC, dedupe, sort."""
+    by_t = {}
+    gran = int(granularity) if granularity else None
+    for r in rows or []:
+        try:
+            t = int(r.get("epoch") or r.get("t") or 0)
+            if t > 10_000_000_000:  # ms → sec
+                t = t // 1000
+            if t <= 0:
+                continue
+            if gran:
+                t = (t // gran) * gran
+            o = float(r.get("open", r.get("o")))
+            h = float(r.get("high", r.get("h")))
+            l = float(r.get("low", r.get("l")))
+            c = float(r.get("close", r.get("c")))
+            if min(o, h, l, c) <= 0:
+                continue
+            h = max(h, o, c)
+            l = min(l, o, c)
+            by_t[t] = {"t": t, "o": o, "h": h, "l": l, "c": c}
+        except (TypeError, ValueError, KeyError):
+            continue
+    return [by_t[k] for k in sorted(by_t.keys())]
+
 APP_ID = clean(APP_ID)
 TOKEN  = clean(TOKEN)
 
@@ -342,6 +368,37 @@ class Bot:
         self.limit_refresh_count = 0                 # how many times limit was refreshed
 
 
+    def load_candles_from_supabase(self) -> int:
+        """Prefill chart memory from Supabase (fast path on boot)."""
+        store = _supa()
+        if not store or not getattr(store, "enabled", False) or not hasattr(store, "list_candles"):
+            return 0
+        total = 0
+        if not hasattr(self, "v75_candles") or self.v75_candles is None:
+            self.v75_candles = {}
+        for sym in globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"]):
+            for gran in (300, 900, 3600):
+                try:
+                    rows = store.list_candles(
+                        symbol=sym,
+                        granularity=gran,
+                        limit=5000,
+                        account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                    )
+                    rows = normalize_candle_rows(rows, gran)
+                    if rows:
+                        self.v75_candles.setdefault(sym, {})[str(gran)] = rows[-5000:]
+                        total += len(rows)
+                        if sym == SHARK_SYMBOL:
+                            eng = self.ensure_shark()
+                            if eng is not None:
+                                eng.set_candles(gran, rows[-200:])
+                except Exception as e:
+                    print(f"[supabase] list_candles {sym}/{gran}: {e}", flush=True)
+        if total:
+            self.note("info", f"Loaded {total} candles from Supabase into chart")
+        return total
+
     def fetch_v75_history(self, years: float = 1.0, symbols=None, granularities=None) -> dict:
         """
         Manual backfill: pull ~1y of V75 OHLC from Deriv (paginated) into
@@ -423,18 +480,7 @@ class Bot:
                             rows = msg.get("candles") or []
                             if not rows:
                                 break
-                            cleaned = []
-                            for r in rows:
-                                try:
-                                    cleaned.append({
-                                        "t": int(r.get("epoch") or r.get("t") or 0),
-                                        "o": float(r.get("open", r.get("o"))),
-                                        "h": float(r.get("high", r.get("h"))),
-                                        "l": float(r.get("low", r.get("l"))),
-                                        "c": float(r.get("close", r.get("c"))),
-                                    })
-                                except (TypeError, ValueError, KeyError):
-                                    continue
+                            cleaned = normalize_candle_rows(rows, gran)
                             if not cleaned:
                                 break
                             series = cleaned + series
@@ -467,8 +513,9 @@ class Bot:
                             time.sleep(0.15)
 
                         # dedupe + sort, keep generous history in memory for chart
-                        by_t = {c["t"]: c for c in series if c["t"] >= start_floor}
-                        ordered = [by_t[k] for k in sorted(by_t.keys())]
+                        ordered = normalize_candle_rows(
+                            [c for c in series if c.get("t", 0) >= start_floor], gran
+                        )
                         self.v75_candles.setdefault(sym, {})[str(int(gran))] = ordered[-8000:]
                         # Feed shark engine for primary symbol
                         if sym == SHARK_SYMBOL:
@@ -1237,19 +1284,11 @@ class Bot:
                     if not hasattr(self, "v75_candles") or self.v75_candles is None:
                         self.v75_candles = {}
                     bucket = self.v75_candles.setdefault(sym, {})
-                    cleaned = []
-                    for r in rows:
-                        try:
-                            cleaned.append({
-                                "t": int(r.get("epoch") or r.get("t") or 0),
-                                "o": float(r.get("open", r.get("o"))),
-                                "h": float(r.get("high", r.get("h"))),
-                                "l": float(r.get("low", r.get("l"))),
-                                "c": float(r.get("close", r.get("c"))),
-                            })
-                        except (TypeError, ValueError, KeyError):
-                            continue
-                    bucket[str(int(gran))] = cleaned[-150:]
+                    cleaned = normalize_candle_rows(rows, int(gran))
+                    # Merge with existing history (don't wipe 1y data with 150-bar snapshot)
+                    prev = bucket.get(str(int(gran)), [])
+                    merged = normalize_candle_rows(list(prev) + cleaned, int(gran))
+                    bucket[str(int(gran))] = merged[-8000:]
                     # Feed primary shark engine only for active SHARK_SYMBOL
                     if sym == SHARK_SYMBOL:
                         eng = self.ensure_shark()
@@ -1281,18 +1320,33 @@ class Bot:
                         gkey = str(int(gran))
                         series = bucket.setdefault(gkey, [])
                         try:
+                            t = int(ohlc.get("epoch") or ohlc.get("open_time") or ohlc.get("t") or 0)
+                            if t > 10_000_000_000:
+                                t = t // 1000
+                            g = int(gran)
+                            t = (t // g) * g
                             row = {
-                                "t": int(ohlc.get("epoch") or ohlc.get("t") or 0),
+                                "t": t,
                                 "o": float(ohlc.get("open", ohlc.get("o"))),
                                 "h": float(ohlc.get("high", ohlc.get("h"))),
                                 "l": float(ohlc.get("low", ohlc.get("l"))),
                                 "c": float(ohlc.get("close", ohlc.get("c"))),
                             }
+                            row["h"] = max(row["h"], row["o"], row["c"])
+                            row["l"] = min(row["l"], row["o"], row["c"])
                             if series and series[-1]["t"] == row["t"]:
-                                series[-1] = row
-                            else:
+                                # update forming candle
+                                prev = series[-1]
+                                series[-1] = {
+                                    "t": row["t"],
+                                    "o": prev["o"],
+                                    "h": max(prev["h"], row["h"]),
+                                    "l": min(prev["l"], row["l"]),
+                                    "c": row["c"],
+                                }
+                            elif not series or row["t"] > series[-1]["t"]:
                                 series.append(row)
-                                bucket[gkey] = series[-150:]
+                                bucket[gkey] = series[-8000:]
                         except (TypeError, ValueError, KeyError):
                             pass
                         if sym == SHARK_SYMBOL:
@@ -1599,6 +1653,19 @@ def run_session(bot: Bot):
                 "subscribe": 1,
             }))
             print(f"  candles: {sym} {label} ({gran}s)")
+
+    # Prefill from Supabase then auto-backfill ~1y in background (once per process)
+    try:
+        bot.load_candles_from_supabase()
+    except Exception as e:
+        print(f"[chart] supabase prefill: {e}", flush=True)
+    try:
+        if not getattr(bot, "_history_autoload_done", False):
+            bot._history_autoload_done = True
+            bot.note("info", "Auto-loading V75 history (5M/15M/1H)…")
+            bot.fetch_v75_history(years=1.0)
+    except Exception as e:
+        print(f"[chart] auto history: {e}", flush=True)
 
     print(f"\nMode: {ACCOUNT_TYPE} | trading={'ON' if TRADING_ENABLED else 'OFF'}")
     print("Strategies: OVER (Over 0) and UNDER (Under 9), scanned at the same time")

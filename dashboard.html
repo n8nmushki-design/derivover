@@ -278,7 +278,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
           <div class="text-xl font-semibold tracking-tight" id="chartPrice">—</div>
           <div class="flex flex-wrap gap-1.5 justify-end mt-1">
             <button type="button" id="btnLoadHist" data-action="fetch_v75_history" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-cyan-400/40" style="color:#00E5FF">Load 1Y history</button>
-            <button type="button" id="btnOverlay" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Overlays on</button>
+            <button type="button" id="btnOverlay" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Overlays off</button>
             <button type="button" id="btnZoomIn" class="px-2 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">+</button>
             <button type="button" id="btnZoomOut" class="px-2 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">−</button>
             <button type="button" id="btnZoomReset" class="px-2 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Reset</button>
@@ -850,7 +850,7 @@ function renderOverview(){
 
 var chartTf = "300";
 var chartSym = "R_75";
-var showOverlays = true;
+var showOverlays = false;
 var lwChart = null;
 var lwSeries = null;
 var lwPriceLines = [];
@@ -954,9 +954,11 @@ function drawSharkChart(resetView){
   var n5 = (v75[chartSym]&&v75[chartSym]["300"]||[]).length;
   var n15 = (v75[chartSym]&&v75[chartSym]["900"]||[]).length;
   var n1h = (v75[chartSym]&&v75[chartSym]["3600"]||[]).length;
+  var hj0 = S.history_job;
+  var histNote = (hj0 && hj0.status==="running") ? (" · loading "+(hj0.progress||0)+"%") : "";
   $("chartStatus").textContent = (n5||n15||n1h)
-    ? ("Bars 5M:"+n5+" · 15M:"+n15+" · 1H:"+n1h+(shark.reason?(" · "+shark.reason):""))
-    : (shark.reason || "No candles yet — tap Load 1Y history");
+    ? ("Bars 5M:"+n5+" · 15M:"+n15+" · 1H:"+n1h+histNote)
+    : (shark.reason || "Loading V75 history…");
 
   // history progress
   var hj = S.history_job;
@@ -991,23 +993,55 @@ function drawSharkChart(resetView){
     return;
   }
 
-  // Build OHLC for lightweight-charts (time in seconds)
+  // Build clean OHLC for lightweight-charts (seconds, deduped, granularity-aligned)
+  var gran = Number(chartTf) || 300;
   var data = [];
   var seen = {};
   rows.forEach(function(b){
     var t = Number(b.t || b.epoch || 0);
-    if(!t || seen[t]) return;
+    if(t > 1e12) t = Math.floor(t/1000);
+    if(!t) return;
+    t = Math.floor(t / gran) * gran;
+    if(seen[t]) return;
     seen[t]=1;
     var o=Number(b.o!=null?b.o:b.open), h=Number(b.h!=null?b.h:b.high);
     var l=Number(b.l!=null?b.l:b.low), c=Number(b.c!=null?b.c:b.close);
     if(!isFinite(o)||!isFinite(h)||!isFinite(l)||!isFinite(c)) return;
+    if(o<=0||h<=0||l<=0||c<=0) return;
+    if(h<l){var tmp=h;h=l;l=tmp;}
+    h=Math.max(h,o,c); l=Math.min(l,o,c);
+    // drop absurd spikes vs neighbors later
     data.push({time:t, open:o, high:h, low:l, close:c});
   });
   data.sort(function(a,b){return a.time-b.time});
-  // Keep last 3000 for performance
-  if(data.length>3000) data=data.slice(-3000);
+  // Remove micro-bars that violate TF spacing (keeps chart from turning into a red wall)
+  var filtered=[];
+  for(var i=0;i<data.length;i++){
+    if(!filtered.length){filtered.push(data[i]); continue;}
+    var prev=filtered[filtered.length-1];
+    var dt=data[i].time-prev.time;
+    if(dt < gran * 0.5){
+      // same candle — merge
+      prev.high=Math.max(prev.high,data[i].high);
+      prev.low=Math.min(prev.low,data[i].low);
+      prev.close=data[i].close;
+    } else {
+      filtered.push(data[i]);
+    }
+  }
+  data=filtered;
+  // Show last 2000 bars max for performance
+  if(data.length>2000) data=data.slice(-2000);
   lwSeries.setData(data);
-  if(resetView) lwChart.timeScale().fitContent();
+  if(resetView){
+    // Focus recent region (last ~120 bars) so the chart is readable
+    var n=data.length;
+    if(n>5){
+      lwChart.timeScale().setVisibleLogicalRange({from: Math.max(0,n-120), to: n+2});
+    } else {
+      lwChart.timeScale().fitContent();
+    }
+  }
 
   var last = data[data.length-1];
   $("chartPrice").textContent = last ? last.close.toFixed(2) : "—";
@@ -1024,12 +1058,12 @@ function drawSharkChart(resetView){
     if(near || chartSym === primary){
       addPL(levels.mid, "#FFB020", "0.5");
       addPL(levels.fib_886, "#A78BFA", "0.886");
-      addPL(levels.ob_lo, "#34D399", "OB lo");
-      addPL(levels.ob_hi, "#34D399", "OB hi");
+      addPL(levels.ob_lo, "rgba(52,211,153,0.7)", "OB");
+      addPL(levels.ob_hi, "rgba(52,211,153,0.7)", "");
       addPL(targets.entry || levels.entry, "#00F2FE", "Entry");
-      addPL(targets.sl, "#f43f5e", "SL");
-      addPL(targets.tp1 || levels.tp1, "#22c55e", "TP1");
-      addPL(targets.tp2 || levels.tp2, "#4ade80", "TP2");
+      if(targets.sl!=null) addPL(targets.sl, "#f43f5e", "SL");
+      if(targets.tp1!=null||levels.tp1!=null) addPL(targets.tp1||levels.tp1, "#22c55e", "TP1");
+      if(targets.tp2!=null||levels.tp2!=null) addPL(targets.tp2||levels.tp2, "#4ade80", "TP2");
     }
   }
 
