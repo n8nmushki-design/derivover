@@ -581,6 +581,18 @@ class Bot:
             self.reconnect_requested = True
             self.note("info", f"Strategy started ({mode})")
             return {"ok": True, "message": f"Started {mode} strategy"}
+        if action in ("set_chart_symbol", "chart_symbol"):
+            sym = (kwargs.get("symbol") or kwargs.get("mode") or "").strip()
+            if sym not in V75_SYMBOLS and sym not in CANDIDATE_SYMBOLS:
+                return {"ok": False, "message": f"Unknown symbol {sym}"}
+            with self.lock:
+                self.chart_symbol = sym
+            # Optional: switch shark primary if V75
+            if sym in V75_SYMBOLS:
+                # keep trading symbol as SHARK_SYMBOL; chart can differ
+                pass
+            self.note("info", f"Chart symbol → {sym}")
+            return {"ok": True, "message": f"Chart: {sym}"}
         if action in ("set_mode", "strategy_mode", "set_strategy"):
             mode = (
                 kwargs.get("mode")
@@ -776,10 +788,17 @@ class Bot:
                 "strategy_mode": getattr(self, "strategy_mode", DEFAULT_STRATEGY_MODE),
                 "shark": (getattr(self, "shark").status() if getattr(self, "shark", None) else {"reason": "unavailable"}),
                 "chart": {
-                    "symbol": SHARK_SYMBOL,
+                    "symbol": getattr(self, "chart_symbol", None) or SHARK_SYMBOL,
+                    "v75_symbols": list(V75_SYMBOLS),
                     "points": list((getattr(self, "price_history", None) or {}).get(SHARK_SYMBOL, []))[-180:]
                     if getattr(self, "price_history", None) is not None
                     else [],
+                    "candles": (getattr(self, "shark").status().get("candles") if getattr(self, "shark", None) else {}),
+                    "v75_candles": getattr(self, "v75_candles", {}) or {},
+                    "targets": (getattr(self, "shark").status().get("targets") if getattr(self, "shark", None) else {}),
+                    "levels": (getattr(self, "shark").status().get("levels") if getattr(self, "shark", None) else {}),
+                    "default_tf": "300",
+                    "strategy_tfs": ["300", "900", "3600"],
                 },
                 "account": dict(ACCOUNT),
                 "currency": self.currency,
@@ -1022,7 +1041,106 @@ class Bot:
 
         t = msg.get("msg_type")
 
-        # ---- tick ----
+        # ---- multi-TF candles / OHLC stream (Shark) ----
+        if t in ("candles", "ohlc", "history") or (t is None and ("candles" in msg or "ohlc" in msg)):
+            try:
+                echo = msg.get("echo_req") if isinstance(msg.get("echo_req"), dict) else {}
+                rows = msg.get("candles") or []
+                gran = echo.get("granularity")
+                sym = (
+                    echo.get("ticks_history")
+                    or echo.get("symbol")
+                    or (msg.get("ohlc") or {}).get("symbol")
+                    or SHARK_SYMBOL
+                )
+                # Store candles for every V75 symbol (chart switcher)
+                if rows and gran:
+                    if not hasattr(self, "v75_candles") or self.v75_candles is None:
+                        self.v75_candles = {}
+                    bucket = self.v75_candles.setdefault(sym, {})
+                    cleaned = []
+                    for r in rows:
+                        try:
+                            cleaned.append({
+                                "t": int(r.get("epoch") or r.get("t") or 0),
+                                "o": float(r.get("open", r.get("o"))),
+                                "h": float(r.get("high", r.get("h"))),
+                                "l": float(r.get("low", r.get("l"))),
+                                "c": float(r.get("close", r.get("c"))),
+                            })
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                    bucket[str(int(gran))] = cleaned[-150:]
+                    # Feed primary shark engine only for active SHARK_SYMBOL
+                    if sym == SHARK_SYMBOL:
+                        eng = self.ensure_shark()
+                        if eng is not None:
+                            eng.set_candles(int(gran), rows)
+                            self.shark_status = eng.status()
+                    try:
+                        store = _supa()
+                        if store and hasattr(store, "save_candles"):
+                            store.save_candles(
+                                symbol=sym,
+                                granularity=int(gran),
+                                rows=rows[-20:],
+                                account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                            )
+                    except Exception:
+                        pass
+                    return
+                # Streaming OHLC update
+                ohlc = msg.get("ohlc") or {}
+                if ohlc:
+                    gran = ohlc.get("granularity") or gran
+                    sym = ohlc.get("symbol") or sym or SHARK_SYMBOL
+                    if gran:
+                        # update v75 store
+                        if not hasattr(self, "v75_candles") or self.v75_candles is None:
+                            self.v75_candles = {}
+                        bucket = self.v75_candles.setdefault(sym, {})
+                        gkey = str(int(gran))
+                        series = bucket.setdefault(gkey, [])
+                        try:
+                            row = {
+                                "t": int(ohlc.get("epoch") or ohlc.get("t") or 0),
+                                "o": float(ohlc.get("open", ohlc.get("o"))),
+                                "h": float(ohlc.get("high", ohlc.get("h"))),
+                                "l": float(ohlc.get("low", ohlc.get("l"))),
+                                "c": float(ohlc.get("close", ohlc.get("c"))),
+                            }
+                            if series and series[-1]["t"] == row["t"]:
+                                series[-1] = row
+                            else:
+                                series.append(row)
+                                bucket[gkey] = series[-150:]
+                        except (TypeError, ValueError, KeyError):
+                            pass
+                        if sym == SHARK_SYMBOL:
+                            eng = self.ensure_shark()
+                            if eng is not None:
+                                sig = eng.upsert_ohlc(int(gran), ohlc)
+                                self.shark_status = eng.status()
+                                if sig and getattr(self, "strategy_mode", "digits") == "shark":
+                                    self._pending_shark_signal = sig
+                                    self.note("info", f"Shark signal: {sig.side} – {sig.reason}")
+                                    try:
+                                        store = _supa()
+                                        if store and hasattr(store, "save_shark_signal"):
+                                            store.save_shark_signal(
+                                                sig,
+                                                account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                                                account_id=ACCOUNT.get("id"),
+                                            )
+                                    except Exception:
+                                        pass
+                                    price = float(ohlc.get("close") or ohlc.get("c") or 0)
+                                    if price:
+                                        self.try_trade(ws, SHARK_SYMBOL, price)
+            except Exception as e:
+                print(f"[shark] candle handle: {e}", flush=True)
+            return
+
         if t == "tick" or "tick" in msg:
             tick = msg.get("tick") or msg
             symbol = (tick.get("symbol") or
@@ -1288,6 +1406,19 @@ def run_session(bot: Bot):
     for sym in CANDIDATE_SYMBOLS:
         ws.send(json.dumps({"ticks": sym, "subscribe": 1}))
         print(f"  subscribed: {sym}")
+
+    # Multi-TF candles for Shark (1H bias, 15M setup, 5M entry + 1M chart)
+    for gran, label in ((60, "1M"), (300, "5M"), (900, "15M"), (3600, "1H")):
+        ws.send(json.dumps({
+            "ticks_history": SHARK_SYMBOL,
+            "adjust_start_time": 1,
+            "count": 120,
+            "end": "latest",
+            "granularity": gran,
+            "style": "candles",
+            "subscribe": 1,
+        }))
+        print(f"  candles: {SHARK_SYMBOL} {label} ({gran}s)")
 
     print(f"\nMode: {ACCOUNT_TYPE} | trading={'ON' if TRADING_ENABLED else 'OFF'}")
     print("Strategies: OVER (Over 0) and UNDER (Under 9), scanned at the same time")

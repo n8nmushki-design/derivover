@@ -320,6 +320,37 @@ class SupabaseStore:
             )
 
 
+    def save_candles(self, *, symbol: str, granularity: int, rows: list, account_type: str = "demo") -> None:
+        """Upsert OHLC candles (best-effort; ignores if table missing)."""
+        if not self.enabled or not rows:
+            return
+        at = account_type if account_type in ("demo", "real") else "demo"
+        payload = []
+        for r in rows:
+            try:
+                payload.append({
+                    "symbol": symbol,
+                    "granularity": int(granularity),
+                    "epoch": int(r.get("epoch") or r.get("t") or 0),
+                    "open": float(r.get("open", r.get("o"))),
+                    "high": float(r.get("high", r.get("h"))),
+                    "low": float(r.get("low", r.get("l"))),
+                    "close": float(r.get("close", r.get("c"))),
+                    "account_type": at,
+                })
+            except (TypeError, ValueError, KeyError):
+                continue
+        if not payload:
+            return
+        with self._lock:
+            # Prefer upsert on (symbol, granularity, epoch)
+            self._request(
+                "POST",
+                "ohlc_candles?on_conflict=symbol,granularity,epoch",
+                payload,
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+
     def save_shark_signal(self, sig, *, account_type: str, account_id: str | None = None) -> None:
         if not self.enabled:
             return

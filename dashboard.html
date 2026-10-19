@@ -37,7 +37,7 @@ body{font-family:Inter,system-ui,sans-serif;background:#0f131c;color:#dfe2ee}
 @media(min-width:1024px){.mobile-only{display:none!important}main{margin-left:16rem}}
 @media(max-width:1023px){.desktop-only{display:none!important}main{padding-bottom:5.5rem}}
 
-button,a,[data-action],[data-goto],[data-tf],[data-page],.ctrl-btn,.tf,.nav-item,.mnav-item{
+button,a,[data-action],[data-goto],[data-tf],[data-chart-tf],[data-v75],[data-page],.ctrl-btn,.tf,.nav-item,.mnav-item{
   cursor:pointer;-webkit-tap-highlight-color:rgba(255,122,0,.25);
 }
 button .material-symbols-outlined,a .material-symbols-outlined,
@@ -274,13 +274,30 @@ button:disabled{opacity:.45;cursor:not-allowed}
           <div class="text-[11px] text-on-surface-variant" id="chartStatus">Waiting for ticks…</div>
         </div>
       </div>
-      <canvas id="sharkChart" height="220" class="w-full rounded-lg bg-black/30"></canvas>
+      <div class="flex flex-wrap items-center gap-2 mb-2">
+        <div id="v75SymBar" class="flex flex-wrap gap-1.5">
+          <button type="button" data-v75="R_75" class="v75-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-cyan-400/50" style="color:#00E5FF">R_75</button>
+          <button type="button" data-v75="1HZ75V" class="v75-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">1HZ75V</button>
+        </div>
+        <span class="text-on-surface-variant text-[10px]">|</span>
+        <div id="chartTfBar" class="flex flex-wrap gap-1.5">
+          <button type="button" data-chart-tf="300" class="tf-btn px-3 py-1 rounded-lg text-[11px] font-semibold border border-cyan-400/50" style="color:#00E5FF">5M Entry</button>
+          <button type="button" data-chart-tf="900" class="tf-btn px-3 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">15M Setup</button>
+          <button type="button" data-chart-tf="3600" class="tf-btn px-3 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">1H Bias</button>
+        </div>
+      </div>
+      <div class="text-[10px] text-on-surface-variant mb-2">Shark stack: <b style="color:#00E5FF">1H BOS</b> → <b style="color:#FFB020">15M OB zone</b> → <b style="color:#A78BFA">5M 0.886 entry</b> · Fibonacci TP1 0.5 / TP2 0.886</div>
+      <canvas id="sharkChart" height="260" class="w-full rounded-lg bg-black/30"></canvas>
       <div class="flex flex-wrap gap-3 mt-2 text-[10px] font-mono text-on-surface-variant">
-        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#00F2FE"></i>Price</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#26a69a"></i>Bull candle</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#ef5350"></i>Bear candle</span>
         <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#FFB020"></i>0.5 mid</span>
         <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#A78BFA"></i>0.886</span>
-        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#34D399"></i>OB zone</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#34D399"></i>OB</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#22c55e"></i>TP1/TP2</span>
+        <span><i class="inline-block w-2 h-2 rounded-full mr-1" style="background:#f43f5e"></i>SL</span>
       </div>
+      <div id="liveTargets" class="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3"></div>
     </div>
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="sharkLevels"></div>
     <div class="rounded-xl border border-outline-variant/20 bg-surface-container p-4">
@@ -815,6 +832,30 @@ function renderOverview(){
 }
 
 
+
+
+var chartTf = "300";
+var chartSym = "R_75";
+function setChartTf(tf){
+  chartTf = String(tf||"300");
+  document.querySelectorAll(".tf-btn").forEach(function(b){
+    var on=b.getAttribute("data-chart-tf")===chartTf;
+    b.style.color = on ? "#00E5FF" : "";
+    b.classList.toggle("border-cyan-400/50", on);
+    b.classList.toggle("border-outline-variant/40", !on);
+  });
+  drawSharkChart();
+}
+function setChartSym(sym){
+  chartSym = String(sym||"R_75");
+  document.querySelectorAll(".v75-btn").forEach(function(b){
+    var on=b.getAttribute("data-v75")===chartSym;
+    b.style.color = on ? "#00E5FF" : "";
+    b.classList.toggle("border-cyan-400/50", on);
+    b.classList.toggle("border-outline-variant/40", !on);
+  });
+  drawSharkChart();
+}
 function drawSharkChart(){
   var canvas=$("sharkChart");
   if(!canvas||!S)return;
@@ -822,77 +863,153 @@ function drawSharkChart(){
   var dpr=window.devicePixelRatio||1;
   var rect=canvas.getBoundingClientRect();
   var w=Math.max(280,Math.floor(rect.width||320));
-  var h=220;
+  var h=280;
   canvas.width=w*dpr; canvas.height=h*dpr;
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,w,h);
-  var pts=(S.chart&&S.chart.points)||[];
+
   var shark=S.shark||{};
-  var levels=shark.levels||{};
-  // Prefer engine closes if more bars
-  if((!pts||pts.length<5) && shark.closes && shark.closes.length){
-    pts=shark.closes.map(function(c,i){return [i,c];});
+  var chart=S.chart||{};
+  var levels=Object.assign({}, shark.levels||{}, chart.levels||{});
+  var targets=Object.assign({}, shark.targets||{}, chart.targets||{});
+  // Prefer per-symbol V75 candle store, fall back to engine candles
+  var v75 = chart.v75_candles || {};
+  var symPack = v75[chartSym] || {};
+  var rows = symPack[chartTf] || symPack[String(chartTf)] || [];
+  if(!rows.length){
+    var allC = (shark.candles||chart.candles||{});
+    rows = allC[chartTf] || allC[String(chartTf)] || [];
   }
-  $("chartTitle").textContent=(S.chart&&S.chart.symbol)||shark.symbol||"R_75";
-  $("chartStatus").textContent=shark.reason||(S.connected?"Streaming…":"Offline");
-  if(!pts.length){
+
+  var tfName = {300:"5M Entry",900:"15M Setup",3600:"1H Bias"}[chartTf]||chartTf;
+  $("chartTitle").textContent = chartSym + " · " + tfName + " · V75";
+  var cnt = shark.counts || {};
+  var n5 = (v75[chartSym]&&v75[chartSym]["300"]||[]).length || cnt["5m"] || 0;
+  var n15 = (v75[chartSym]&&v75[chartSym]["900"]||[]).length || cnt["15m"] || 0;
+  var n1h = (v75[chartSym]&&v75[chartSym]["3600"]||[]).length || cnt["1h"] || 0;
+  $("chartStatus").textContent = (shark.reason||"Building multi-TF…") + " · 5M:"+n5+" 15M:"+n15+" 1H:"+n1h;
+
+  if(!rows||!rows.length){
     ctx.fillStyle="#64748b";
     ctx.font="12px sans-serif";
-    ctx.fillText("Waiting for live Deriv ticks…",12,h/2);
+    ctx.fillText("Loading "+chartSym+" candles from Deriv…",12,h/2);
+    renderLiveTargets(targets, levels);
+    renderSharkLevelsPanel(levels, targets, shark);
     return;
   }
-  var prices=pts.map(function(p){return Array.isArray(p)?Number(p[1]):Number(p);}).filter(function(x){return isFinite(x);});
-  if(!prices.length)return;
-  var lo=Math.min.apply(null,prices), hi=Math.max.apply(null,prices);
-  // expand for levels
-  ["mid","fib_886","ob_lo","ob_hi","leg_lo","leg_hi"].forEach(function(k){
-    if(levels[k]!=null&&isFinite(Number(levels[k]))){lo=Math.min(lo,Number(levels[k]));hi=Math.max(hi,Number(levels[k]));}
+
+  var slice=rows.slice(-70);
+  var lo=Infinity,hi=-Infinity;
+  slice.forEach(function(b){
+    var L=Number(b.l!=null?b.l:b.low), H=Number(b.h!=null?b.h:b.high);
+    if(L<lo)lo=L; if(H>hi)hi=H;
   });
-  if(hi===lo){hi+=1;lo-=1;}
-  var pad= (hi-lo)*0.08; lo-=pad; hi+=pad;
-  function Y(v){return 12+(h-24)*(1-(v-lo)/(hi-lo));}
-  function X(i,n){return 8+(w-16)*(n<=1?0:i/(n-1));}
-  // OB zone
+  ["mid","fib_886","ob_lo","ob_hi","tp1","tp2","entry","leg_lo","leg_hi"].forEach(function(k){
+    var v=levels[k]!=null?levels[k]:targets[k];
+    if(v!=null&&isFinite(Number(v))){lo=Math.min(lo,Number(v));hi=Math.max(hi,Number(v));}
+  });
+  if(targets.sl!=null&&isFinite(Number(targets.sl))){lo=Math.min(lo,Number(targets.sl));hi=Math.max(hi,Number(targets.sl));}
+  if(!isFinite(lo)||!isFinite(hi)||hi===lo){hi=(lo||0)+1;lo=(lo||0)-1;}
+  var pad=(hi-lo)*0.08; lo-=pad; hi+=pad;
+
+  function Y(v){return 28+(h-48)*(1-(Number(v)-lo)/(hi-lo));}
+  var n=slice.length;
+  var slot=(w-24)/Math.max(n,1);
+  var cw=Math.max(2, slot*0.62);
+
+  // Strategy: Order Block zone
   if(levels.ob_lo!=null&&levels.ob_hi!=null){
-    var y1=Y(Number(levels.ob_hi)), y2=Y(Number(levels.ob_lo));
-    ctx.fillStyle="rgba(52,211,153,0.12)";
-    ctx.fillRect(8,Math.min(y1,y2),w-16,Math.abs(y2-y1)||2);
+    var y1=Y(levels.ob_hi), y2=Y(levels.ob_lo);
+    ctx.fillStyle="rgba(52,211,153,0.14)";
+    ctx.fillRect(12,Math.min(y1,y2),w-24,Math.max(2,Math.abs(y2-y1)));
+    ctx.fillStyle="#34D399";
+    ctx.font="10px monospace";
+    ctx.fillText("OB ZONE", 14, Math.min(y1,y2)-4);
   }
-  function hline(val,color,dash){
+
+  function hline(val,color,label,dash){
     if(val==null||!isFinite(Number(val)))return;
-    var y=Y(Number(val));
-    ctx.strokeStyle=color; ctx.lineWidth=1;
+    var y=Y(val);
+    ctx.strokeStyle=color; ctx.lineWidth=1.25;
     ctx.setLineDash(dash||[]);
-    ctx.beginPath(); ctx.moveTo(8,y); ctx.lineTo(w-8,y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(12,y); ctx.lineTo(w-12,y); ctx.stroke();
     ctx.setLineDash([]);
+    if(label){
+      ctx.fillStyle=color; ctx.font="10px monospace";
+      ctx.fillText(label+" "+Number(val).toFixed(2), 14, y-3);
+    }
   }
-  hline(levels.mid,"#FFB020",[4,3]);
-  hline(levels.fib_886,"#A78BFA",[2,2]);
-  // price line
-  ctx.strokeStyle="#00F2FE"; ctx.lineWidth=2; ctx.beginPath();
-  prices.forEach(function(v,i){
-    var x=X(i,prices.length), y=Y(v);
-    if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  // Shark Fibonacci / structure overlays
+  hline(levels.leg_hi,"#64748b","Swing H",[2,4]);
+  hline(levels.leg_lo,"#64748b","Swing L",[2,4]);
+  hline(levels.mid,"#FFB020","0.5 mid",[4,3]);
+  hline(levels.fib_886,"#A78BFA","Shark 0.886",[2,2]);
+  hline(targets.tp1||levels.tp1,"#22c55e","TP1 0.5",[]);
+  hline(targets.tp2||levels.tp2,"#4ade80","TP2 0.886",[6,3]);
+  hline(targets.sl,"#f43f5e","SL",[]);
+  hline(targets.entry||levels.entry,"#00F2FE","ENTRY",[1,2]);
+
+  // Candlesticks
+  slice.forEach(function(b,idx){
+    var o=Number(b.o!=null?b.o:b.open), c=Number(b.c!=null?b.c:b.close);
+    var bh=Number(b.h!=null?b.h:b.high), bl=Number(b.l!=null?b.l:b.low);
+    var x=12+idx*slot+slot/2;
+    var up=c>=o;
+    var col=up?"#26a69a":"#ef5350";
+    ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,Y(bh)); ctx.lineTo(x,Y(bl)); ctx.stroke();
+    var yO=Y(o), yC=Y(c);
+    var top=Math.min(yO,yC), bot=Math.max(yO,yC);
+    ctx.fillRect(x-cw/2, top, cw, Math.max(1, bot-top));
   });
-  ctx.stroke();
-  // last point
-  var lx=X(prices.length-1,prices.length), ly=Y(prices[prices.length-1]);
-  ctx.fillStyle="#00F2FE"; ctx.beginPath(); ctx.arc(lx,ly,3,0,Math.PI*2); ctx.fill();
-  $("chartPrice").textContent=prices[prices.length-1].toFixed(2);
-  // levels tiles
-  var lv=$("sharkLevels");
-  if(lv){
-    var items=[
-      ["BOS", levels.bos||"—", ""],
-      ["Mid 0.5", levels.mid!=null?Number(levels.mid).toFixed(2):"—", ""],
-      ["Fib 0.886", levels.fib_886!=null?Number(levels.fib_886).toFixed(2):"—", ""],
-      ["OB", (levels.ob_lo!=null&&levels.ob_hi!=null)?(Number(levels.ob_lo).toFixed(1)+"–"+Number(levels.ob_hi).toFixed(1)):"—", ""]
-    ];
-    lv.innerHTML=items.map(function(it){
-      return '<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-3"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+it[0]+'</div><div class="text-sm font-semibold mt-0.5">'+it[1]+'</div></div>';
-    }).join("");
+
+  // BOS badge
+  if(levels.bos||shark.bias){
+    var bos=String(levels.bos||shark.bias);
+    ctx.fillStyle=bos==="bullish"?"rgba(34,197,94,0.2)":"rgba(244,63,94,0.2)";
+    ctx.fillRect(w-108, 8, 96, 18);
+    ctx.fillStyle=bos==="bullish"?"#22c55e":"#f43f5e";
+    ctx.font="11px monospace";
+    ctx.fillText("BOS "+bos.toUpperCase(), w-100, 21);
   }
+
+  var last=slice[slice.length-1];
+  var lastC=Number(last.c!=null?last.c:last.close);
+  $("chartPrice").textContent=isFinite(lastC)?lastC.toFixed(2):"—";
+  renderLiveTargets(targets, levels);
+  renderSharkLevelsPanel(levels, targets, shark);
 }
+function renderLiveTargets(targets, levels){
+  var el=$("liveTargets");
+  if(!el)return;
+  targets=targets||{}; levels=levels||{};
+  var side=targets.side||(levels.bos==="bullish"?"buy":(levels.bos==="bearish"?"sell":"—"));
+  var items=[
+    ["Side", String(side).toUpperCase()],
+    ["Entry", targets.entry!=null?Number(targets.entry).toFixed(2):(levels.price!=null?Number(levels.price).toFixed(2):"—")],
+    ["SL", targets.sl!=null?Number(targets.sl).toFixed(2):"—"],
+    ["TP1 0.5", (targets.tp1||levels.tp1)!=null?Number(targets.tp1||levels.tp1).toFixed(2):"—"],
+    ["TP2 0.886", (targets.tp2||levels.tp2)!=null?Number(targets.tp2||levels.tp2).toFixed(2):"—"]
+  ];
+  el.innerHTML=items.map(function(it){
+    return '<div class="rounded-lg border border-outline-variant/20 bg-black/20 p-2"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+it[0]+'</div><div class="text-sm font-semibold" style="color:#00E5FF">'+it[1]+'</div></div>';
+  }).join("");
+}
+function renderSharkLevelsPanel(levels, targets, shark){
+  var lv=$("sharkLevels");
+  if(!lv)return;
+  levels=levels||{}; targets=targets||{}; shark=shark||{};
+  var items=[
+    ["1H Bias", levels.bos||shark.bias||"—"],
+    ["15M Mid 0.5", levels.mid!=null?Number(levels.mid).toFixed(2):"—"],
+    ["5M Shark 0.886", levels.fib_886!=null?Number(levels.fib_886).toFixed(2):"—"],
+    ["OB zone", (levels.ob_lo!=null&&levels.ob_hi!=null)?(Number(levels.ob_lo).toFixed(1)+"–"+Number(levels.ob_hi).toFixed(1)):"—"]
+  ];
+  lv.innerHTML=items.map(function(it){
+    return '<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-3"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+it[0]+'</div><div class="text-sm font-semibold mt-0.5">'+it[1]+'</div></div>';
+  }).join("");
+}
+
 function renderSharkTradeHist(){
   var el=$("sharkTradeHist");
   if(!el||!S)return;
@@ -1013,6 +1130,20 @@ document.addEventListener("click",function(e){
     var extra={};
     if(act.getAttribute("data-mode"))extra.mode=act.getAttribute("data-mode");
     sendControl(a, extra);
+    return;
+  }
+  // Chart timeframe (Shark) — must not use data-tf (trade filters)
+  var ctf=t.closest("[data-chart-tf]");
+  if(ctf){
+    e.preventDefault();
+    setChartTf(ctf.getAttribute("data-chart-tf"));
+    return;
+  }
+  // V75 symbol switcher
+  var v75b=t.closest("[data-v75]");
+  if(v75b){
+    e.preventDefault();
+    setChartSym(v75b.getAttribute("data-v75"));
     return;
   }
 
