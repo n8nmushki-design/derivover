@@ -55,6 +55,20 @@ except Exception as _shark_imp_err:
     SharkEngine = None  # type: ignore
     print(f"[shark] strategy_shark import failed: {_shark_imp_err}", flush=True)
 
+try:
+    from strategy_matches import MatchEngine, MATCH_SYMBOLS
+except Exception as _match_imp_err:
+    MatchEngine = None  # type: ignore
+    MATCH_SYMBOLS = ("1HZ10V", "1HZ100V", "R_10", "R_100")
+    print(f"[matches] strategy_matches import failed: {_match_imp_err}", flush=True)
+
+try:
+    from strategy_nextdigit import NextDigitEngine, NEXT_DIGIT_SYMBOLS
+except Exception as _nd_imp_err:
+    NextDigitEngine = None  # type: ignore
+    NEXT_DIGIT_SYMBOLS = ("1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V", "R_10", "R_25", "R_50", "R_75", "R_100")
+    print(f"[nextdigit] strategy_nextdigit import failed: {_nd_imp_err}", flush=True)
+
 from websocket import (
     create_connection,
     WebSocketTimeoutException,
@@ -106,11 +120,19 @@ MAX_01_FREQUENCY     = 0.10
 MAX_89_FREQUENCY     = 0.10
 MIN_TICKS_FOR_FILTER = 50
 
-# Strategy modes: digits (Over/Under) or shark (Structure+OB+0.886)
-STRATEGY_MODES = ("digits", "shark")
+# Strategy modes
+STRATEGY_MODES = ("digits", "shark", "matches", "nextdigit")
 DEFAULT_STRATEGY_MODE = (os.environ.get("STRATEGY_MODE", "shark") or "shark").strip().lower()
 if DEFAULT_STRATEGY_MODE not in STRATEGY_MODES:
     DEFAULT_STRATEGY_MODE = "shark"
+_raw_active = (os.environ.get("ACTIVE_STRATEGIES", DEFAULT_STRATEGY_MODE) or DEFAULT_STRATEGY_MODE).strip().lower()
+if _raw_active in ("all", "*"):
+    DEFAULT_ACTIVE_STRATEGIES = list(STRATEGY_MODES)
+else:
+    DEFAULT_ACTIVE_STRATEGIES = [s.strip() for s in _raw_active.split(",") if s.strip() in STRATEGY_MODES]
+    if not DEFAULT_ACTIVE_STRATEGIES:
+        DEFAULT_ACTIVE_STRATEGIES = [DEFAULT_STRATEGY_MODE]
+STRATEGY_BUDGET = float(os.environ.get("STRATEGY_BUDGET", "100") or 100)
 SHARK_SYMBOL = (os.environ.get("SHARK_SYMBOL", "R_75") or "R_75").strip()
 V75_SYMBOLS = ["R_75", "1HZ75V"]
 if SHARK_SYMBOL not in V75_SYMBOLS:
@@ -316,6 +338,36 @@ def decimals_needed(price) -> int:
     s = f"{float(price):.8f}".rstrip("0")
     return len(s.split(".")[1]) if "." in s else 0
 
+
+def bot_strategy_active(bot, name: str) -> bool:
+    """Safe multi-strategy gate (never AttributeError)."""
+    try:
+        fn = getattr(bot, "strategy_active", None)
+        if callable(fn):
+            return bool(fn(name))
+    except Exception:
+        pass
+    stopped = getattr(bot, "strategy_stopped", None) or {}
+    if stopped.get(name):
+        return False
+    active = getattr(bot, "active_strategies", None)
+    if not active:
+        active = [getattr(bot, "strategy_mode", "digits") or "digits"]
+    return name in active
+
+
+def bot_strategy_budget_left(bot, name: str) -> float:
+    try:
+        fn = getattr(bot, "strategy_budget_left", None)
+        if callable(fn):
+            return float(fn(name))
+    except Exception:
+        pass
+    pnl = float((getattr(bot, "strategy_pnl", None) or {}).get(name, 0.0) or 0.0)
+    budget = float(getattr(bot, "strategy_budget", 100.0) or 100.0)
+    return max(0.0, budget + min(0.0, pnl))
+
+
 class Bot:
     def __init__(self):
         self.idx             = {"over": 0, "under": 0}   # barrier ladder position per strategy
@@ -356,13 +408,32 @@ class Bot:
         self.manual_strategy = None                  # "over" | "under" | None (auto)
         self.manual_skip_filter = False              # manual trade: ignore digit filter once
         self.strategy_mode = DEFAULT_STRATEGY_MODE
+        self.active_strategies = list(DEFAULT_ACTIVE_STRATEGIES)
+        self.strategy_budget = float(STRATEGY_BUDGET)
+        self.strategy_pnl = {m: 0.0 for m in STRATEGY_MODES}
+        self.strategy_trades = {m: 0 for m in STRATEGY_MODES}
+        self.strategy_stopped = {m: False for m in STRATEGY_MODES}
         self.shark = None
         self.shark_status = {}
+        self.matches = None
+        self.matches_status = {}
+        self.nextdigit = None
+        self.nextdigit_status = {}
+        self._pending_shark_signal = None
+        self._pending_match_signals = []
+        self._pending_nextdigit_signal = None
         try:
             self.ensure_shark()
         except Exception:
             self.shark = None
-        self._pending_shark_signal = None
+        try:
+            self.ensure_matches()
+        except Exception:
+            self.matches = None
+        try:
+            self.ensure_nextdigit()
+        except Exception:
+            self.nextdigit = None
         self.trades_window_started = time.time()     # session start (legacy)
         self.limit_hit_at = None                     # set only when MAX_TRADES is hit
         self.limit_refresh_count = 0                 # how many times limit was refreshed
@@ -555,6 +626,91 @@ class Bot:
         threading.Thread(target=worker, name="v75-history", daemon=True).start()
         return {"ok": True, "message": "V75 history load started (up to ~1 year)"}
 
+    def _supa_sync_strategy_budgets(self) -> None:
+        """Persist per-strategy $budget / P/L to Supabase."""
+        store = _supa()
+        if not store or not getattr(store, "enabled", False):
+            return
+        if not hasattr(store, "upsert_strategy_budget"):
+            return
+        at = ACCOUNT.get("type") or ACCOUNT_TYPE
+        aid = ACCOUNT.get("id")
+        budget = float(getattr(self, "strategy_budget", 100.0) or 100.0)
+        pnl_map = getattr(self, "strategy_pnl", {}) or {}
+        trades_map = getattr(self, "strategy_trades", {}) or {}
+        stopped_map = getattr(self, "strategy_stopped", {}) or {}
+        for name in STRATEGY_MODES:
+            try:
+                store.upsert_strategy_budget(
+                    strategy=name,
+                    account_type=at,
+                    account_id=aid,
+                    budget=budget,
+                    pnl=float(pnl_map.get(name, 0.0) or 0.0),
+                    trades=int(trades_map.get(name, 0) or 0),
+                    stopped=bool(stopped_map.get(name, False)),
+                    session_id=getattr(store, "current_session_id", None),
+                )
+            except Exception as e:
+                print(f"[supabase] strategy_budget {name}: {e}", flush=True)
+
+    def strategy_active(self, name: str) -> bool:
+        if getattr(self, "strategy_stopped", {}).get(name):
+            return False
+        active = getattr(self, "active_strategies", None)
+        if not active:
+            active = [getattr(self, "strategy_mode", "digits")]
+        return name in active
+
+    def strategy_budget_left(self, name: str) -> float:
+        pnl = float((getattr(self, "strategy_pnl", {}) or {}).get(name, 0.0) or 0.0)
+        budget = float(getattr(self, "strategy_budget", 100.0) or 100.0)
+        return max(0.0, budget + min(0.0, pnl))
+
+    def ensure_matches(self):
+        eng = getattr(self, "matches", None)
+        if eng is not None:
+            return eng
+        try:
+            cls = MatchEngine
+        except NameError:
+            cls = None
+        if cls is None:
+            try:
+                from strategy_matches import MatchEngine as cls  # type: ignore
+            except Exception as e:
+                self.note("warn", f"Match engine unavailable: {e}")
+                return None
+        try:
+            self.matches = cls(both=True)
+            return self.matches
+        except Exception as e:
+            self.note("warn", f"Match engine init failed: {e}")
+            self.matches = None
+            return None
+
+    def ensure_nextdigit(self):
+        eng = getattr(self, "nextdigit", None)
+        if eng is not None:
+            return eng
+        try:
+            cls = NextDigitEngine
+        except NameError:
+            cls = None
+        if cls is None:
+            try:
+                from strategy_nextdigit import NextDigitEngine as cls  # type: ignore
+            except Exception as e:
+                self.note("warn", f"NextDigit engine unavailable: {e}")
+                return None
+        try:
+            self.nextdigit = cls()
+            return self.nextdigit
+        except Exception as e:
+            self.note("warn", f"NextDigit init failed: {e}")
+            self.nextdigit = None
+            return None
+
     def ensure_shark(self):
         """Return SharkEngine instance or None (never raises NameError)."""
         eng = getattr(self, "shark", None)
@@ -609,6 +765,8 @@ class Bot:
             "strategy_stopped": None,
             "matches": None,
             "matches_status": {},
+            "nextdigit": None,
+            "nextdigit_status": {},
             "shark": None,
             "shark_status": {},
             "_pending_shark_signal": None,
@@ -825,6 +983,32 @@ class Bot:
                 pass
             self.note("info", f"Chart symbol → {sym}")
             return {"ok": True, "message": f"Chart: {sym}"}
+        if action in ("set_active_strategies", "active_strategies", "set_strategies"):
+            raw = kwargs.get("strategies") or kwargs.get("modes") or kwargs.get("mode") or ""
+            if isinstance(raw, str):
+                if raw.strip().lower() in ("all", "*"):
+                    chosen = list(STRATEGY_MODES)
+                else:
+                    chosen = [s.strip().lower() for s in raw.split(",") if s.strip().lower() in STRATEGY_MODES]
+            elif isinstance(raw, (list, tuple)):
+                chosen = [str(s).strip().lower() for s in raw if str(s).strip().lower() in STRATEGY_MODES]
+            else:
+                chosen = []
+            if not chosen:
+                return {"ok": False, "message": "Use digits,shark,matches,nextdigit or all"}
+            with self.lock:
+                self.active_strategies = chosen
+                self.strategy_mode = chosen[0]
+                for m in chosen:
+                    self.strategy_stopped[m] = False
+                if "shark" in chosen:
+                    self.ensure_shark()
+                if "matches" in chosen:
+                    self.ensure_matches()
+                if "nextdigit" in chosen:
+                    self.ensure_nextdigit()
+            self.note("info", "Active strategies → " + ",".join(chosen))
+            return {"ok": True, "message": "Active: " + ",".join(chosen)}
         if action in ("set_mode", "strategy_mode", "set_strategy"):
             mode = (
                 kwargs.get("mode")
@@ -837,16 +1021,23 @@ class Bot:
             if mode in ("over", "under"):
                 self.force_next(strategy=mode)
                 return {"ok": True, "message": f"Digit preference: {mode}"}
-            if mode not in ("digits", "shark"):
-                return {"ok": False, "message": "mode must be digits or shark"}
+            if mode not in STRATEGY_MODES:
+                return {"ok": False, "message": "mode must be digits, shark, matches, or nextdigit"}
             with self.lock:
                 self.strategy_mode = mode
-                if mode == "shark":
-                    eng = self.ensure_shark()
-                    if eng is None:
-                        return {"ok": False, "message": "Shark engine unavailable – ensure strategy_shark.py is deployed"}
-            self.note("info", f"Strategy mode → {mode}")
-            return {"ok": True, "message": f"Strategy mode: {mode}"}
+                if mode not in getattr(self, "active_strategies", []):
+                    cur = list(getattr(self, "active_strategies", []) or [])
+                    cur.append(mode)
+                    self.active_strategies = list(dict.fromkeys(cur))
+                self.strategy_stopped[mode] = False
+                if mode == "shark" and self.ensure_shark() is None:
+                    return {"ok": False, "message": "Shark engine unavailable"}
+                if mode == "matches" and self.ensure_matches() is None:
+                    return {"ok": False, "message": "Matches engine unavailable"}
+                if mode == "nextdigit" and self.ensure_nextdigit() is None:
+                    return {"ok": False, "message": "NextDigit engine unavailable"}
+            self.note("info", f"Strategy focus → {mode} | active={','.join(self.active_strategies)}")
+            return {"ok": True, "message": f"Focus {mode}; active: {','.join(self.active_strategies)}"}
         return {"ok": False, "message": f"Unknown action: {action}"}
 
 
@@ -878,6 +1069,10 @@ class Bot:
                 currency=self.currency or "USD",
                 strategy_mode=getattr(self, "strategy_mode", "digits"),
             )
+            try:
+                self._supa_sync_strategy_budgets()
+            except Exception:
+                pass
         except Exception as e:
             self.note("warn", f"Supabase session start failed: {e}")
 
@@ -1129,33 +1324,56 @@ class Bot:
         return best
 
     def can_trade(self, symbol: str) -> str | None:
-        """Return the strategy to trade on this market now, or None."""
-        self.ensure_attrs()
-        if self.stop or self.paused or self.pending or self.open_contract:
+        """Return strategy key if a trade is allowed for this symbol, else None."""
+        if self.stop or self.paused or not TRADING_ENABLED:
             return None
-        if self.manual_symbol and symbol != self.manual_symbol:
+        if self.pending or self.open_contract:
             return None
-        if time.time() - self.last_trade_ts < COOLDOWN_SECONDS:
-            return None
-        # Auto-refresh trade window every TRADE_LIMIT_REFRESH_SECS (default 5 min)
-        self.maybe_auto_refresh_trade_limit()
         if self.trades >= MAX_TRADES:
-            # Soft block – do not kill the bot thread; wait for refresh button / auto timer
-            # Timer starts in maybe_auto_refresh_trade_limit (only after limit hit)
+            self._maybe_refresh_trade_limit()
+            if self.trades >= MAX_TRADES:
+                return None
+        now = time.time()
+        if now - getattr(self, "last_trade_ts", 0) < COOLDOWN_SECONDS:
             return None
-        if self.manual_strategy:
-            key = self.manual_strategy
-            if getattr(self, 'manual_skip_filter', False) or self.is_eligible(symbol, key):
-                return key
-            return None
-        if self.manual_symbol:
-            key = self.pick_strategy(symbol)
-            if key:
-                return key
-            if getattr(self, 'manual_skip_filter', False):
+
+        if getattr(self, "manual_strategy", None) or getattr(self, "manual_symbol", None):
+            if self.manual_symbol and symbol != self.manual_symbol:
+                return None
+            return self.manual_strategy or "digits"
+
+        if bot_strategy_active(self, "shark") and symbol == SHARK_SYMBOL:
+            if bot_strategy_budget_left(self, "shark") >= STAKE:
+                sig = getattr(self, "_pending_shark_signal", None)
+                if sig and getattr(sig, "symbol", None) == symbol:
+                    return "shark"
+
+        if bot_strategy_active(self, "matches") and bot_strategy_budget_left(self, "matches") >= STAKE:
+            try:
+                from strategy_matches import MATCH_SYMBOLS as _MS
+            except Exception:
+                _MS = ("1HZ10V", "1HZ100V", "R_10", "R_100")
+            if symbol in _MS:
+                for s in (getattr(self, "_pending_match_signals", None) or []):
+                    if getattr(s, "symbol", None) == symbol:
+                        return "matches"
+
+        if bot_strategy_active(self, "nextdigit") and bot_strategy_budget_left(self, "nextdigit") >= STAKE:
+            try:
+                from strategy_nextdigit import NEXT_DIGIT_SYMBOLS as _NDS
+            except Exception:
+                _NDS = ("1HZ10V", "1HZ100V", "R_10", "R_100")
+            if symbol in _NDS:
+                sig = getattr(self, "_pending_nextdigit_signal", None)
+                if sig and getattr(sig, "symbol", None) == symbol:
+                    return "nextdigit"
+
+        if bot_strategy_active(self, "digits") and bot_strategy_budget_left(self, "digits") >= STAKE:
+            if self.is_eligible(symbol, "over"):
                 return "over"
-            return None
-        return self.pick_strategy(symbol)
+            if self.is_eligible(symbol, "under"):
+                return "under"
+        return None
 
     def try_trade(self, ws, symbol: str, price: float):
         key = self.can_trade(symbol)
@@ -1228,6 +1446,48 @@ class Bot:
                 "side": sig.side,
                 "setup_meta": sig.meta,
                 "strategy_mode": "matches",
+            }
+            self.manual_symbol = None
+            self.manual_strategy = None
+            self.manual_skip_filter = False
+            ws.send(json.dumps({
+                "buy": 1,
+                "price": STAKE,
+                "parameters": {
+                    "amount": STAKE,
+                    "basis": "stake",
+                    "contract_type": ctype,
+                    "currency": self.currency,
+                    "duration": 1,
+                    "duration_unit": "t",
+                    "underlying_symbol": symbol,
+                    "barrier": barrier,
+                },
+            }))
+            return
+
+        # ---- Next digit prediction (DIGITMATCH) ----
+        if key == "nextdigit":
+            sig = getattr(self, "_pending_nextdigit_signal", None)
+            if not sig or getattr(sig, "symbol", None) != symbol:
+                return
+            self._pending_nextdigit_signal = None
+            barrier = str(sig.digit)
+            ctype = "DIGITMATCH"
+            print(f"\n★ NEXTDIGIT {symbol} predict={barrier} conf={sig.confidence:.1%} – {sig.reason}")
+            if not TRADING_ENABLED:
+                print("  [signals only] TRADING_ENABLED=False")
+                return
+            self.pending = True
+            self.pending_since = time.time()
+            self.pending_trade = {
+                "symbol": symbol,
+                "contract_type": ctype,
+                "barrier": int(sig.digit),
+                "strategy": "nextdigit",
+                "side": "match",
+                "setup_meta": sig.meta,
+                "strategy_mode": "nextdigit",
             }
             self.manual_symbol = None
             self.manual_strategy = None
@@ -1446,6 +1706,28 @@ class Bot:
                 ph.append([round(time.time(), 2), float(price)])
             except Exception:
                 pass
+            if bot_strategy_active(self, "matches"):
+                meng = self.ensure_matches()
+                if meng is not None:
+                    try:
+                        sigs = meng.on_digit(symbol, digit)
+                        self.matches_status = meng.status()
+                        if sigs:
+                            self._pending_match_signals = list(sigs)
+                            self.note("info", f"Matches: {sigs[0].reason}")
+                    except Exception as e:
+                        print(f"[matches] on_digit: {e}", flush=True)
+            if bot_strategy_active(self, "nextdigit"):
+                neng = self.ensure_nextdigit()
+                if neng is not None:
+                    try:
+                        nsig = neng.on_digit(symbol, digit)
+                        self.nextdigit_status = neng.status()
+                        if nsig:
+                            self._pending_nextdigit_signal = nsig
+                            self.note("info", f"NextDigit: {nsig.reason}")
+                    except Exception as e:
+                        print(f"[nextdigit] on_digit: {e}", flush=True)
             self.last_price[symbol] = price
             self.ticks_seen += 1
 
@@ -1471,7 +1753,7 @@ class Bot:
 
             # Shark mode: evaluate structure/OB/0.886 on configured symbol
             shark_eng = getattr(self, "shark", None)
-            if getattr(self, "strategy_mode", "digits") == "shark" and symbol == SHARK_SYMBOL:
+            if bot_strategy_active(self, "shark") and symbol == SHARK_SYMBOL:
                 if shark_eng is None:
                     shark_eng = self.ensure_shark()
                 if shark_eng is not None:
@@ -1489,7 +1771,8 @@ class Bot:
                                                    account_id=ACCOUNT.get("id"))
                     except Exception:
                         pass
-            if self.strategy_active("digits") or self.strategy_active("shark") or self.strategy_active("matches"):
+            if (bot_strategy_active(self, "digits") or bot_strategy_active(self, "shark")
+                    or bot_strategy_active(self, "matches") or bot_strategy_active(self, "nextdigit")):
                 self.try_trade(ws, symbol, price)
 
         # ---- balance ----
@@ -1641,6 +1924,10 @@ class Bot:
             if self.strategy_pnl[mode] <= -float(getattr(self, "strategy_budget", 100.0)):
                 self.strategy_stopped[mode] = True
                 self.note("warn", f"{mode} budget ${self.strategy_budget:.0f} spent — strategy paused")
+            try:
+                self._supa_sync_strategy_budgets()
+            except Exception:
+                pass
             if key in STRATEGIES:
                 if profit > 0:
                     self.on_win(key)
@@ -2138,6 +2425,30 @@ else:
             limit = 50
         rows = _supa().list_trades(account_type=at, session_id=sid, limit=limit)
         return jsonify(enabled=True, account_type=at or "all", session_id=sid, trades=rows)
+
+    @app.route("/api/history/strategy_budgets")
+    def api_history_strategy_budgets():
+        if not key_ok():
+            return jsonify(error="forbidden"), 403
+        store = _supa()
+        if store and not getattr(store, "enabled", False) and hasattr(store, "reload"):
+            store.reload()
+        if not store or not getattr(store, "enabled", False):
+            return jsonify(enabled=False, budgets=[], message="Supabase not configured")
+        at = (request.args.get("account_type") or "").strip().lower()
+        if at not in ("demo", "real"):
+            at = ACCOUNT_TYPE if ACCOUNT_TYPE in ("demo", "real") else None
+        sid = (request.args.get("session_id") or "").strip() or None
+        rows = []
+        if hasattr(store, "list_strategy_budgets"):
+            rows = store.list_strategy_budgets(account_type=at, session_id=sid, limit=50)
+        # Also return live bot view
+        live = {}
+        try:
+            live = (BOT.snapshot(bot_running(), bool(os.environ.get("STATUS_KEY"))) or {}).get("strategies_ui") or {}
+        except Exception:
+            live = {}
+        return jsonify(enabled=True, budgets=rows, live=live)
 
     @app.route("/api/control", methods=["POST"])
     def api_control():

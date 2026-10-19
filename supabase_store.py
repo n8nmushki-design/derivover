@@ -412,6 +412,60 @@ class SupabaseStore:
                 continue
         return out
 
+    def upsert_strategy_budget(
+        self,
+        *,
+        strategy: str,
+        account_type: str,
+        account_id: str | None,
+        budget: float,
+        pnl: float,
+        trades: int,
+        stopped: bool,
+        session_id: str | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        at = account_type if account_type in ("demo", "real") else "demo"
+        row = {
+            "strategy": strategy,
+            "account_type": at,
+            "account_id": account_id,
+            "session_id": session_id or self.current_session_id,
+            "budget": float(budget),
+            "pnl": float(pnl),
+            "trades": int(trades),
+            "budget_left": max(0.0, float(budget) + min(0.0, float(pnl))),
+            "stopped": bool(stopped),
+            "updated_at": None,  # default now()
+        }
+        # strip None updated_at so DB default applies
+        row.pop("updated_at", None)
+        with self._lock:
+            self._request(
+                "POST",
+                "strategy_budgets?on_conflict=account_type,strategy,session_id",
+                row,
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+
+    def list_strategy_budgets(
+        self,
+        *,
+        account_type: str | None = None,
+        session_id: str | None = None,
+        limit: int = 50,
+    ) -> list:
+        if not self.enabled:
+            return []
+        path = f"strategy_budgets?select=*&order=updated_at.desc&limit={int(limit)}"
+        if account_type in ("demo", "real"):
+            path += f"&account_type=eq.{account_type}"
+        if session_id:
+            path += f"&session_id=eq.{session_id}"
+        data = self._request("GET", path)
+        return data if isinstance(data, list) else []
+
     def list_sessions(self, *, account_type: str | None = None, limit: int = 30) -> list:
         if not self.enabled:
             return []

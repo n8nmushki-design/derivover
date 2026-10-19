@@ -419,16 +419,16 @@ button:disabled{opacity:.45;cursor:not-allowed}
 </section>
 
 <section id="page-strategy" class="page space-y-4">
-  <div class="rounded-xl bg-surface-container border border-outline-variant/20 p-4">
-    <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+  <div class="rounded-2xl bg-surface-container border border-outline-variant/20 p-4">
+    <div class="flex items-start justify-between gap-2 flex-wrap mb-3">
       <div>
-        <h2 class="text-sm font-semibold">Strategies</h2>
-        <p class="text-[11px] text-on-surface-variant">Demo budget <strong id="stratBudgetLabel">$100</strong> each · run one, two, or all together</p>
+        <h2 class="text-base font-semibold">Strategy desk</h2>
+        <p class="text-[11px] text-on-surface-variant mt-0.5">Each strategy has a <span class="text-emerald-300 font-semibold">$100</span> demo budget · P/L saved to Supabase</p>
       </div>
       <div class="flex flex-wrap gap-1.5">
-        <button type="button" data-action="set_active_strategies" data-strategies="all" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-cyan-400/40" style="color:#00E5FF">Run all</button>
-        <button type="button" data-action="set_active_strategies" data-strategies="digits,shark" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Digits+Shark</button>
-        <button type="button" data-action="set_active_strategies" data-strategies="shark,matches" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Shark+Matches</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="all" class="ctrl-btn px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border border-cyan-400/40" style="color:#00E5FF">Run all</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="digits,shark" class="ctrl-btn px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Digits+Shark</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="shark,matches,nextdigit" class="ctrl-btn px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Shark+Digits*</button>
       </div>
     </div>
     <div id="activeStratBar" class="flex flex-wrap gap-2 mb-3"></div>
@@ -436,67 +436,117 @@ button:disabled{opacity:.45;cursor:not-allowed}
       <button type="button" data-strat-tab="digits" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-primary/40 text-primary">Digits</button>
       <button type="button" data-strat-tab="shark" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Shark</button>
       <button type="button" data-strat-tab="matches" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Matches</button>
+      <button type="button" data-strat-tab="nextdigit" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Next Digit</button>
       <button type="button" data-strat-tab="run" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Run control</button>
     </div>
   </div>
 
-  <!-- Mini: Digits -->
   <div id="stratMini-digits" class="strat-mini space-y-3">
-    <div class="rounded-xl border border-primary/30 bg-surface-container p-4">
+    <div class="rounded-2xl border border-orange-400/25 bg-gradient-to-br from-orange-500/10 to-transparent p-4">
       <div class="flex items-start justify-between gap-2">
         <div>
-          <div class="text-sm font-semibold text-primary">Digits Over / Under</div>
-          <p class="text-[11px] text-on-surface-variant mt-1">Dual scanner · DIGITOVER 0 + DIGITUNDER 9 · frequency filter</p>
+          <div class="text-[10px] font-mono uppercase tracking-wide text-orange-300/80">Strategy · Digits</div>
+          <div class="text-lg font-semibold text-orange-200 mt-0.5">Over 0 / Under 9</div>
+          <p class="text-[11px] text-on-surface-variant mt-1">Dual scanner · DIGITOVER + DIGITUNDER · frequency filter on all indices</p>
         </div>
-        <button type="button" data-action="set_active_strategies" data-strategies="digits" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-primary/40 text-primary">Solo</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="digits" class="ctrl-btn px-3 py-1.5 rounded-xl text-[11px] font-semibold border border-orange-400/40 text-orange-200">Solo run</button>
       </div>
-      <div class="grid grid-cols-3 gap-2 mt-3" id="miniDigitsStats"></div>
-      <div id="miniDigitsBody" class="mt-3 text-sm text-on-surface-variant">Barrier ladders and live eligibility appear when digits strategy is active.</div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4" id="miniDigitsStats"></div>
+      <div class="mt-4 rounded-xl bg-black/25 border border-white/5 p-3">
+        <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Live status</div>
+        <div id="miniDigitsBody" class="text-sm text-on-surface-variant">Barrier ladders appear when Digits is active.</div>
+      </div>
+      <div class="mt-3 rounded-xl bg-black/25 border border-white/5 p-3">
+        <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Budget (Supabase)</div>
+        <div id="miniDigitsBudget" class="text-sm">—</div>
+      </div>
     </div>
   </div>
 
-  <!-- Mini: Shark -->
   <div id="stratMini-shark" class="strat-mini space-y-3 hidden">
-    <div class="shark-card rounded-xl p-4">
+    <div class="rounded-2xl border border-cyan-400/25 bg-gradient-to-br from-cyan-500/10 to-transparent p-4">
       <div class="flex items-start justify-between gap-2">
         <div>
-          <div class="text-sm font-semibold" style="color:#00E5FF">Structure + OB + Shark</div>
-          <p class="text-[11px] text-on-surface-variant mt-1">1H BOS · 15M OB · 5M 0.886 · CALL/PUT on R_75</p>
+          <div class="text-[10px] font-mono uppercase tracking-wide" style="color:#00E5FF">Strategy · Shark</div>
+          <div class="text-lg font-semibold mt-0.5" style="color:#E0FBFF">Structure + OB + 0.886</div>
+          <p class="text-[11px] text-on-surface-variant mt-1">1H BOS · 15M order block · 5M Shark entry · CALL/PUT on R_75</p>
         </div>
-        <button type="button" data-action="set_active_strategies" data-strategies="shark" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-cyan-400/40" style="color:#00E5FF">Solo</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="shark" class="ctrl-btn px-3 py-1.5 rounded-xl text-[11px] font-semibold border border-cyan-400/40" style="color:#00E5FF">Solo run</button>
       </div>
-      <div class="grid grid-cols-3 gap-2 mt-3" id="miniSharkStats"></div>
-      <div id="miniSharkBody" class="mt-3 text-[12px] text-on-surface-variant">Multi-TF confluence status loads here.</div>
-      <button type="button" data-goto="dashboard" class="mt-3 text-[11px] font-medium" style="color:#00E5FF">Open live Shark chart →</button>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4" id="miniSharkStats"></div>
+      <div class="mt-4 rounded-xl bg-black/25 border border-white/5 p-3">
+        <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Engine</div>
+        <div id="miniSharkBody" class="text-sm text-on-surface-variant">Waiting for multi-TF confluence…</div>
+      </div>
+      <div class="mt-3 rounded-xl bg-black/25 border border-white/5 p-3">
+        <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Budget (Supabase)</div>
+        <div id="miniSharkBudget" class="text-sm">—</div>
+      </div>
+      <button type="button" data-goto="dashboard" class="mt-3 text-[11px] font-medium" style="color:#00E5FF">Open Shark chart on Dash →</button>
     </div>
   </div>
 
-  <!-- Mini: Matches -->
   <div id="stratMini-matches" class="strat-mini space-y-3 hidden">
-    <div class="rounded-xl border border-violet-400/30 bg-surface-container p-4">
+    <div class="rounded-2xl border border-violet-400/25 bg-gradient-to-br from-violet-500/10 to-transparent p-4">
       <div class="flex items-start justify-between gap-2">
         <div>
-          <div class="text-sm font-semibold text-violet-300">Digit Matches / Difference</div>
-          <p class="text-[11px] text-on-surface-variant mt-1">DIGITMATCH + DIGITDIFF · V10 1s / V100 1s · hot/cold digit edge</p>
+          <div class="text-[10px] font-mono uppercase tracking-wide text-violet-300/90">Strategy · Matches</div>
+          <div class="text-lg font-semibold text-violet-100 mt-0.5">Digit Match / Difference</div>
+          <p class="text-[11px] text-on-surface-variant mt-1">DIGITMATCH + DIGITDIFF · hot/cold digit edge · V10/V100 1s</p>
         </div>
-        <button type="button" data-action="set_active_strategies" data-strategies="matches" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-violet-400/40 text-violet-300">Solo</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="matches" class="ctrl-btn px-3 py-1.5 rounded-xl text-[11px] font-semibold border border-violet-400/40 text-violet-200">Solo run</button>
       </div>
-      <div class="grid grid-cols-3 gap-2 mt-3" id="miniMatchesStats"></div>
-      <div id="miniMatchesBody" class="mt-3 text-[12px] text-on-surface-variant">Waiting for digit histogram on 1HZ10V / 1HZ100V…</div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4" id="miniMatchesStats"></div>
+      <div class="mt-4 rounded-xl bg-black/25 border border-white/5 p-3">
+        <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Digit heat</div>
+        <div id="miniMatchesBody" class="text-sm text-on-surface-variant">Collecting digit histograms…</div>
+      </div>
+      <div class="mt-3 rounded-xl bg-black/25 border border-white/5 p-3">
+        <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Budget (Supabase)</div>
+        <div id="miniMatchesBudget" class="text-sm">—</div>
+      </div>
     </div>
   </div>
 
-  <!-- Mini: Run control -->
+  <div id="stratMini-nextdigit" class="strat-mini space-y-3 hidden">
+    <div class="rounded-2xl border border-sky-400/30 bg-gradient-to-br from-sky-500/15 via-blue-500/5 to-transparent p-4">
+      <div class="flex items-start justify-between gap-2">
+        <div>
+          <div class="text-[10px] font-mono uppercase tracking-wide text-sky-300">Strategy · Next Digit</div>
+          <div class="text-lg font-semibold text-sky-50 mt-0.5">Next-digit predictor</div>
+          <p class="text-[11px] text-on-surface-variant mt-1">Transition matrix P(next|last) · DIGITMATCH · 1-tick · all digit indices</p>
+        </div>
+        <button type="button" data-action="set_active_strategies" data-strategies="nextdigit" class="ctrl-btn px-3 py-1.5 rounded-xl text-[11px] font-semibold border border-sky-400/50 text-sky-200">Solo run</button>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4" id="miniNextStats"></div>
+      <div class="mt-4 rounded-xl bg-black/30 border border-sky-400/10 p-3">
+        <div class="text-[10px] font-mono uppercase text-sky-300/80 mb-2">Predictions</div>
+        <div id="miniNextBody" class="text-sm text-on-surface-variant leading-relaxed">Collecting transitions…</div>
+      </div>
+      <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div class="rounded-xl bg-black/30 border border-white/5 p-3">
+          <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Budget (Supabase)</div>
+          <div id="miniNextBudget" class="text-sm">—</div>
+        </div>
+        <div class="rounded-xl bg-black/30 border border-white/5 p-3">
+          <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">How it trades</div>
+          <div class="text-[12px] text-on-surface-variant">Predicts digit 0–9 from recent transitions. Trades DIGITMATCH when confidence &gt; ~14%.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="stratMini-run" class="strat-mini space-y-3 hidden">
-    <div class="rounded-xl bg-surface-container border border-outline-variant/20 p-4">
-      <h3 class="text-sm font-semibold mb-2">Run combination</h3>
-      <p class="text-[11px] text-on-surface-variant mb-3">Toggle which strategies may trade. Each has a $100 demo budget (stops that strategy only when spent).</p>
+    <div class="rounded-2xl bg-surface-container border border-outline-variant/20 p-4">
+      <h3 class="text-sm font-semibold mb-1">Run combination</h3>
+      <p class="text-[11px] text-on-surface-variant mb-3">Toggle strategies independently. Each stops only when its own $100 budget is spent.</p>
       <div class="space-y-2" id="runToggles"></div>
       <div class="flex flex-wrap gap-2 mt-4">
         <button type="button" data-action="set_active_strategies" data-strategies="digits" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-outline-variant/40">Only Digits</button>
         <button type="button" data-action="set_active_strategies" data-strategies="shark" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-outline-variant/40">Only Shark</button>
         <button type="button" data-action="set_active_strategies" data-strategies="matches" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-outline-variant/40">Only Matches</button>
-        <button type="button" data-action="set_active_strategies" data-strategies="all" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-cyan-400/40" style="color:#00E5FF">All three</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="nextdigit" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-outline-variant/40">Only Next Digit</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="all" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-cyan-400/40" style="color:#00E5FF">All four</button>
       </div>
       <div id="runBudgetTable" class="mt-4 overflow-x-auto text-sm"></div>
     </div>
@@ -826,31 +876,61 @@ function showStratTab(id){
   var pane=$("stratMini-"+stratTab);
   if(pane) pane.classList.remove("hidden");
 }
+
 function renderStrategyPage(){
   if(!S) return;
   var budget = S.strategy_budget!=null?S.strategy_budget:100;
   var bl=$("stratBudgetLabel"); if(bl) bl.textContent="$"+Number(budget).toFixed(0);
+  var ui = S.strategies_ui || {};
   var active = S.active_strategies || [S.strategy_mode||"shark"];
   var pnl = S.strategy_pnl || {};
   var trades = S.strategy_trades || {};
   var stopped = S.strategy_stopped || {};
+  function card(m){
+    var c = ui[m] || {};
+    return {
+      active: c.active!=null?c.active:(active.indexOf(m)>=0 && !stopped[m]),
+      budget: c.budget!=null?c.budget:budget,
+      pnl: c.pnl!=null?c.pnl:Number(pnl[m]||0),
+      trades: c.trades!=null?c.trades:Number(trades[m]||0),
+      left: c.budget_left!=null?c.budget_left:Math.max(0, budget+Math.min(0,Number(pnl[m]||0))),
+      stopped: c.stopped!=null?c.stopped:!!stopped[m]
+    };
+  }
   var bar=$("activeStratBar");
   if(bar){
-    bar.innerHTML = ["digits","shark","matches"].map(function(m){
-      var on=active.indexOf(m)>=0 && !stopped[m];
-      var left = Math.max(0, budget + Math.min(0, Number(pnl[m]||0)));
-      return '<span class="px-2 py-1 rounded-full text-[10px] font-semibold border '+(on?"border-emerald-400/40 text-emerald-300":"border-outline-variant/30 text-on-surface-variant")+'">'+m+(on?"":" off")+' · $'+left.toFixed(0)+' left</span>';
+    bar.innerHTML=["digits","shark","matches","nextdigit"].map(function(m){
+      var c=card(m);
+      return '<span class="px-2.5 py-1 rounded-full text-[10px] font-semibold border '+(c.active?"border-emerald-400/40 text-emerald-300":"border-outline-variant/30 text-on-surface-variant")+'">'+m+(c.active?"":" off")+' · $'+Number(c.left).toFixed(0)+'</span>';
     }).join("");
   }
-  function tile(label,val){
-    return '<div class="rounded-lg border border-outline-variant/20 bg-black/20 p-2"><div class="text-[10px] uppercase text-on-surface-variant">'+label+'</div><div class="text-sm font-semibold">'+val+'</div></div>';
+  function tile(label,val,cls){
+    return '<div class="rounded-xl border border-white/5 bg-black/20 p-2.5"><div class="text-[10px] uppercase tracking-wide text-on-surface-variant">'+label+'</div><div class="text-sm font-semibold mt-0.5 '+(cls||"")+'">'+val+'</div></div>';
   }
-  var md=$("miniDigitsStats");
-  if(md) md.innerHTML = tile("P/L", (pnl.digits!=null?(Number(pnl.digits)>=0?"+":"")+Number(pnl.digits).toFixed(2):"0.00"))+tile("Trades", String(trades.digits||0))+tile("Budget left", "$"+Math.max(0,budget+Math.min(0,Number(pnl.digits||0))).toFixed(0));
-  var ms=$("miniSharkStats");
-  if(ms) ms.innerHTML = tile("P/L", (pnl.shark!=null?(Number(pnl.shark)>=0?"+":"")+Number(pnl.shark).toFixed(2):"0.00"))+tile("Trades", String(trades.shark||0))+tile("Budget left", "$"+Math.max(0,budget+Math.min(0,Number(pnl.shark||0))).toFixed(0));
-  var mm=$("miniMatchesStats");
-  if(mm) mm.innerHTML = tile("P/L", (pnl.matches!=null?(Number(pnl.matches)>=0?"+":"")+Number(pnl.matches).toFixed(2):"0.00"))+tile("Trades", String(trades.matches||0))+tile("Budget left", "$"+Math.max(0,budget+Math.min(0,Number(pnl.matches||0))).toFixed(0));
+  function budgetHtml(c){
+    var p=Number(c.pnl||0);
+    var st=c.stopped?"Stopped (budget)":(c.active?"Active":"Off");
+    return '<div class="flex flex-wrap gap-3 text-[12px]"><span>Allocated <b class="text-emerald-300">$'+Number(c.budget).toFixed(0)+'</b></span><span>Left <b>$'+Number(c.left).toFixed(0)+'</b></span><span class="'+(p>=0?"text-emerald-400":"text-error")+'">P/L '+(p>=0?"+":"")+p.toFixed(2)+'</span><span>Trades '+c.trades+'</span><span class="text-on-surface-variant">'+st+'</span></div>';
+  }
+  function fillStats(id, m, colorCls){
+    var el=$(id); if(!el)return;
+    var c=card(m);
+    var p=Number(c.pnl||0);
+    el.innerHTML=
+      tile("Budget","$"+Number(c.budget).toFixed(0))+
+      tile("Left","$"+Number(c.left).toFixed(0), c.left<20?"text-error":"text-emerald-300")+
+      tile("P/L",(p>=0?"+":"")+p.toFixed(2), p>=0?"text-emerald-400":"text-error")+
+      tile("Trades", String(c.trades));
+  }
+  fillStats("miniDigitsStats","digits");
+  fillStats("miniSharkStats","shark");
+  fillStats("miniMatchesStats","matches");
+  fillStats("miniNextStats","nextdigit");
+  var bd=$("miniDigitsBudget"); if(bd) bd.innerHTML=budgetHtml(card("digits"));
+  var bs=$("miniSharkBudget"); if(bs) bs.innerHTML=budgetHtml(card("shark"));
+  var bm=$("miniMatchesBudget"); if(bm) bm.innerHTML=budgetHtml(card("matches"));
+  var bn=$("miniNextBudget"); if(bn) bn.innerHTML=budgetHtml(card("nextdigit"));
+
   var shark=S.shark||{};
   var mb=$("miniSharkBody");
   if(mb) mb.textContent = shark.reason || "Waiting for multi-TF confluence…";
@@ -859,24 +939,34 @@ function renderStrategyPage(){
   if(mbody){
     var by=match.by_symbol||{};
     var lines=Object.keys(by).slice(0,4).map(function(sym){
-      var s=by[sym]; return sym+": ticks "+(s.ticks||0)+(s.ready?(" hot="+s.hot+" cold="+s.cold):" collecting");
+      var s=by[sym]; return sym+": ticks "+(s.ticks||0)+(s.ready?(" · hot "+s.hot+" / cold "+s.cold):" collecting");
     });
-    mbody.innerHTML = (match.reason||"Collecting digits…")+(lines.length?"<br>"+lines.join("<br>"):"");
+    mbody.innerHTML=(match.reason||"Collecting digits…")+(lines.length?"<br>"+lines.join("<br>"):"");
+  }
+  var nd=S.nextdigit||{};
+  var nbody=$("miniNextBody");
+  if(nbody){
+    var by2=nd.by_symbol||{};
+    var lines2=Object.keys(by2).slice(0,6).map(function(sym){
+      var s=by2[sym]||{};
+      return '<div class="flex justify-between gap-2 border-b border-white/5 py-1"><span class="font-mono text-sky-200/90">'+sym+'</span><span>'+(s.ready?('<b class="text-sky-300">→ '+s.prediction+'</b> · '+Math.round((s.confidence||0)*100)+'% <span class="text-on-surface-variant">('+esc(String(s.source||""))+')</span>'):('collecting '+(s.ticks||0)))+'</span></div>';
+    });
+    nbody.innerHTML=(nd.reason?('<div class="mb-2 text-on-surface-variant">'+esc(nd.reason)+'</div>'):"")+ (lines2.length?lines2.join(""):"No symbols yet");
   }
   var rt=$("runToggles");
   if(rt){
-    rt.innerHTML=["digits","shark","matches"].map(function(m){
-      var on=active.indexOf(m)>=0;
-      return '<label class="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-outline-variant/20"><span class="text-sm font-medium capitalize">'+m+'</span><button type="button" data-toggle-strat="'+m+'" class="ctrl-btn px-2 py-1 rounded-md text-[11px] font-semibold border '+(on?"border-emerald-400/50 text-emerald-300":"border-outline-variant/40")+'">'+(on?"ON":"OFF")+'</button></label>';
+    rt.innerHTML=["digits","shark","matches","nextdigit"].map(function(m){
+      var c=card(m);
+      return '<label class="flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl border border-outline-variant/20 bg-black/10"><span class="text-sm font-medium capitalize">'+m+' <span class="text-[10px] text-on-surface-variant">$'+Number(c.left).toFixed(0)+' left</span></span><button type="button" data-toggle-strat="'+m+'" class="ctrl-btn px-2.5 py-1 rounded-md text-[11px] font-semibold border '+(c.active?"border-emerald-400/50 text-emerald-300":"border-outline-variant/40")+'">'+(c.active?"ON":"OFF")+'</button></label>';
     }).join("");
   }
   var tbl=$("runBudgetTable");
   if(tbl){
-    tbl.innerHTML='<table class="w-full text-left"><thead><tr class="text-[10px] uppercase text-on-surface-variant"><th class="py-1">Strategy</th><th>P/L</th><th>Trades</th><th>Left</th><th>State</th></tr></thead><tbody>'+
-      ["digits","shark","matches"].map(function(m){
-        var p=Number(pnl[m]||0); var left=Math.max(0,budget+Math.min(0,p));
-        var st=stopped[m]?"budget stop":(active.indexOf(m)>=0?"active":"off");
-        return '<tr class="border-t border-outline-variant/10"><td class="py-1.5 capitalize">'+m+'</td><td class="'+(p>=0?"text-emerald-400":"text-error")+'">'+(p>=0?"+":"")+p.toFixed(2)+'</td><td>'+(trades[m]||0)+'</td><td>$'+left.toFixed(0)+'</td><td>'+st+'</td></tr>';
+    tbl.innerHTML='<table class="w-full text-left"><thead><tr class="text-[10px] uppercase text-on-surface-variant"><th class="py-1">Strategy</th><th>Budget</th><th>P/L</th><th>Left</th><th>Trades</th><th>State</th></tr></thead><tbody>'+
+      ["digits","shark","matches","nextdigit"].map(function(m){
+        var c=card(m); var p=Number(c.pnl||0);
+        var st=c.stopped?"budget stop":(c.active?"active":"off");
+        return '<tr class="border-t border-outline-variant/10"><td class="py-1.5 capitalize">'+m+'</td><td>$'+Number(c.budget).toFixed(0)+'</td><td class="'+(p>=0?"text-emerald-400":"text-error")+'">'+(p>=0?"+":"")+p.toFixed(2)+'</td><td>$'+Number(c.left).toFixed(0)+'</td><td>'+c.trades+'</td><td>'+st+'</td></tr>';
       }).join("")+'</tbody></table>';
   }
 }
