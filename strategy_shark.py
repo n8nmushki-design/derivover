@@ -304,9 +304,19 @@ class SharkEngine:
 
     def _publish_levels(self, m5, m15, **kw):
         price = m5[-1]["c"] if m5 else None
+        # Independent BOS on each TF (same method, different bars)
+        m5b = list(self.candles.get(TF_ENTRY) or [])
+        m15b = list(self.candles.get(TF_SETUP) or [])
+        h1b = list(self.candles.get(TF_BIAS) or [])
+        bos_5m = self._bos(m5b) if len(m5b) >= 20 else None
+        bos_15m = self._bos(m15b) if len(m15b) >= 20 else None
+        bos_1h = self._bos(h1b) if len(h1b) >= 20 else (kw.get("bias") or self.bias)
         self.levels = {
             "price": price,
-            "bos": kw.get("bias"),
+            "bos": kw.get("bias") or bos_1h,  # primary = 1H strategy bias
+            "bos_1h": bos_1h,
+            "bos_15m": bos_15m,
+            "bos_5m": bos_5m,
             "mid": kw.get("mid"),
             "fib_886": kw.get("fib_886"),
             "leg_lo": kw.get("leg_lo"),
@@ -344,6 +354,9 @@ class SharkEngine:
             },
             "reason": self.last_eval_reason,
             "bias": self.bias,
+            "bos_1h": (self.levels or {}).get("bos_1h") or self.bias,
+            "bos_15m": (self.levels or {}).get("bos_15m"),
+            "bos_5m": (self.levels or {}).get("bos_5m"),
             "levels": dict(self.levels or {}),
             "targets": dict(self.targets or {}),
             "candles": {

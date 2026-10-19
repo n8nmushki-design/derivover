@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
 
-MATCH_SYMBOLS = ("1HZ10V", "1HZ100V", "R_10", "R_100")
+MATCH_SYMBOLS = ("1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V", "R_10", "R_25", "R_50", "R_75", "R_100")
 
 
 @dataclass

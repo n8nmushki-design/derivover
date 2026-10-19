@@ -1362,11 +1362,14 @@ class Bot:
             try:
                 from strategy_matches import MATCH_SYMBOLS as _MS
             except Exception:
-                _MS = ("1HZ10V", "1HZ100V", "R_10", "R_100")
-            if symbol in _MS:
+                _MS = ("1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+                       "R_10", "R_25", "R_50", "R_75", "R_100")
+            # Allow any subscribed volatility symbol for matches
+            if symbol in _MS or symbol in CANDIDATE_SYMBOLS:
                 for s in (getattr(self, "_pending_match_signals", None) or []):
                     if getattr(s, "symbol", None) == symbol:
                         return "matches"
+                # If pending exists for another symbol, still allow this symbol's pending only
 
         if bot_strategy_active(self, "nextdigit") and bot_strategy_budget_left(self, "nextdigit") >= STAKE:
             try:
@@ -1615,6 +1618,10 @@ class Bot:
                         eng = self.ensure_shark()
                         if eng is not None:
                             eng.set_candles(int(gran), rows)
+                            try:
+                                eng.evaluate()
+                            except Exception:
+                                pass
                             self.shark_status = eng.status()
                     try:
                         store = _supa()
@@ -1979,6 +1986,12 @@ def run_session(bot: Bot):
     print("Connected.")
     bot.connected = True
     bot.last_error = None
+    try:
+        bot.ensure_matches()
+        bot.ensure_nextdigit()
+        bot.ensure_shark()
+    except Exception as e:
+        print(f"[engines] post-connect: {e}", flush=True)
     bot.note("info", f"Connected to Deriv ({ACCOUNT['type']} account {ACCOUNT['id']})")
     with bot.lock:
         bot.pending = False            # an unanswered proposal died with the old connection

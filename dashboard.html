@@ -349,6 +349,10 @@ button:disabled{opacity:.45;cursor:not-allowed}
     </div>
   </div>
   <div class="grid grid-cols-2 lg:grid-cols-4 gap-3" id="stats"></div>
+  <div id="runningStrats" class="rounded-xl border border-outline-variant/20 bg-surface-container p-3">
+    <div class="text-[10px] font-mono uppercase text-on-surface-variant mb-2">Strategies running</div>
+    <div id="runningStratsInner" class="flex flex-wrap gap-2"></div>
+  </div>
   <div id="dashQuick" class="flex flex-wrap gap-2"></div>
   <div class="rounded-xl bg-surface-container border border-outline-variant/20 p-4 digits-only">
     <div class="flex items-center justify-between mb-3"><h2 class="text-sm font-semibold">Real-time market digits</h2>
@@ -657,7 +661,9 @@ function renderAlerts(){
   else{
     if(S.last_error)out+=alertHtml("err","Bot error",S.last_error);
     if(!S.bot_running){out+=alertHtml("err","Bot process not running","The trading thread is stopped. Tap Reconnect or Resume. If it keeps failing, check Render logs for login errors (DERIV_APP_ID / DERIV_TOKEN / ACCOUNT_TYPE).");}
-    else if(!S.connected&&!S.stopped){var off=S.offline_secs!=null?(" Offline "+S.offline_secs+"s."):"";out+=alertHtml("warn","Not connected to Deriv","Balance and digits appear after the WebSocket connects."+off+" Tap Reconnect if this lasts more than 30s. Open Logs for login steps. Check DERIV_APP_ID, DERIV_TOKEN (trade scope), ACCOUNT_TYPE=demo|real.");}
+    else if(!S.connected&&!S.stopped){var off=S.offline_secs!=null?(" Offline "+S.offline_secs+"s."):"";out+=alertHtml("warn","Not connected to Deriv","Balance and digits appear after the WebSocket connects."+off+" Tap Reconnect if this lasts more than 30s. Open Logs for login steps. Check DERIV_APP_ID, DERIV_TOKEN (trade scope), ACCOUNT_TYPE=demo|real.");
+      if(autoReconnectArmed && S.offline_secs!=null && S.offline_secs>45){autoReconnectArmed=false; try{sendControl("reconnect",{});}catch(e){} setTimeout(function(){autoReconnectArmed=true;},120000);}
+    }
     if(S.stats&&S.limits&&S.stats.trades>=S.limits.max_trades){out+=alertHtml("warn","Trade limit reached",S.stats.trades+" / "+S.limits.max_trades+" trades used. Tap Refresh limit or wait for auto-refresh ("+((S.limits.refresh_in!=null)?(Math.ceil(S.limits.refresh_in/60)+" min left"):"every 5 min")+").");}
     var r=S.stop_reason,autoHint=S.auto_restart?("Auto-restart in "+(S.restart_in!=null?S.restart_in+"s":"a moment")+"."):"Restart the process to trade again.";
     if(S.stopped){
@@ -877,7 +883,23 @@ function showStratTab(id){
   if(pane) pane.classList.remove("hidden");
 }
 
+
+function renderRunningStrats(){
+  var el=$("runningStratsInner");
+  if(!el)return;
+  if(!S){el.innerHTML='<span class="text-[11px] text-on-surface-variant">Waiting for state…</span>';return;}
+  var run=S.running_strategies||S.active_strategies||[];
+  var stopped=S.strategy_stopped||{};
+  var labels={digits:"Digits Over/Under",shark:"Shark 0.886",matches:"Digit Matches",nextdigit:"Next Digit"};
+  var all=["digits","shark","matches","nextdigit"];
+  el.innerHTML=all.map(function(m){
+    var on=run.indexOf(m)>=0 && !stopped[m];
+    var st=stopped[m]?"budget stop":(on?"RUNNING":"off");
+    return '<span class="px-2.5 py-1 rounded-full text-[11px] font-semibold border '+(on?"border-emerald-400/50 text-emerald-300 bg-emerald-400/10":"border-outline-variant/30 text-on-surface-variant")+'">'+(labels[m]||m)+' · '+st+'</span>';
+  }).join("");
+}
 function renderStrategyPage(){
+
   if(!S) return;
   var budget = S.strategy_budget!=null?S.strategy_budget:100;
   var bl=$("stratBudgetLabel"); if(bl) bl.textContent="$"+Number(budget).toFixed(0);
@@ -1194,8 +1216,13 @@ function drawSharkChart(resetView){
   var n1h = (v75[chartSym]&&v75[chartSym]["3600"]||[]).length;
   var hj0 = S.history_job;
   var histNote = (hj0 && hj0.status==="running") ? (" · loading "+(hj0.progress||0)+"%") : "";
+  var lv = Object.assign({}, shark.levels||{}, chart.levels||{});
+  var b1 = lv.bos_1h || shark.bos_1h || shark.bias || "—";
+  var b15 = lv.bos_15m || shark.bos_15m || "—";
+  var b5 = lv.bos_5m || shark.bos_5m || "—";
+  var bosLine = " · BOS 1H:"+String(b1)+" | 15M:"+String(b15)+" | 5M:"+String(b5);
   $("chartStatus").textContent = (n5||n15||n1h)
-    ? ("Bars 5M:"+n5+" · 15M:"+n15+" · 1H:"+n1h+histNote)
+    ? ("Bars 5M:"+n5+" · 15M:"+n15+" · 1H:"+n1h+bosLine+histNote)
     : (shark.reason || "Loading V75 history…");
 
   // history progress
@@ -1303,6 +1330,12 @@ function drawSharkChart(resetView){
       if(targets.tp1!=null||levels.tp1!=null) addPL(targets.tp1||levels.tp1, "#22c55e", "TP1");
       if(targets.tp2!=null||levels.tp2!=null) addPL(targets.tp2||levels.tp2, "#4ade80", "TP2");
     }
+    // BOS label for selected TF (always visible in legend area via status; mark mid as BOS context)
+    var tfBos = chartTf==="3600" ? (levels.bos_1h||levels.bos) : (chartTf==="900" ? levels.bos_15m : levels.bos_5m);
+    if(tfBos){
+      var lastPx = data.length ? data[data.length-1].close : null;
+      if(lastPx!=null) addPL(lastPx, tfBos==="bullish"?"#22c55e":"#f43f5e", "BOS "+String(tfBos).toUpperCase());
+    }
   }
 
   renderLiveTargets(targets, levels);
@@ -1362,7 +1395,7 @@ function applyModeTheme(){
     // keep structure; subtitle via sibling if any
   }
 }
-function render(){applyModeTheme();renderHeader();renderAlerts();renderAge();updateControlUI();renderOverview();renderQuickActions();if(!S)return;renderBalance();renderStats();renderMarkets();renderTrades();renderStrategy();renderStrategyPage();renderEvents();if((S.strategy_mode||"shark")==="shark"){drawSharkChart();renderSharkTradeHist()}}
+function render(){applyModeTheme();renderHeader();renderAlerts();renderAge();updateControlUI();renderOverview();renderQuickActions();if(!S)return;renderBalance();renderStats();renderMarkets();renderTrades();renderRunningStrats();renderStrategy();renderStrategyPage();renderEvents();if((S.strategy_mode||"shark")==="shark"){drawSharkChart();renderSharkTradeHist()}}
 
 /* ----- auto-trade controls ----- */
 function setCtrlMsg(msg, ok){
@@ -1793,7 +1826,9 @@ if(as){
   });
 })();
 
-function tick(){var headers=key?{"X-Status-Key":key}:{};return fetch("/api/state",{headers:headers,cache:"no-store"}).then(function(r){if(r.status===403){needKey=true;S=null;failures=0;render();return}if(!r.ok)throw new Error("HTTP "+r.status);return r.json().then(function(s){S=s;lastOk=Date.now();failures=0;needKey=false;render();if(Date.now()-histLoaded>15000)loadHistory().then(function(){if(location.hash.indexOf("trade")>=0||document.getElementById("page-trades")&&!document.getElementById("page-trades").classList.contains("hidden"))renderTrades()})})}).catch(function(){failures++;render()})}
+var autoReconnectArmed=true;
+function tick(){
+var headers=key?{"X-Status-Key":key}:{};return fetch("/api/state",{headers:headers,cache:"no-store"}).then(function(r){if(r.status===403){needKey=true;S=null;failures=0;render();return}if(!r.ok)throw new Error("HTTP "+r.status);return r.json().then(function(s){S=s;lastOk=Date.now();failures=0;needKey=false;render();if(Date.now()-histLoaded>15000)loadHistory().then(function(){if(location.hash.indexOf("trade")>=0||document.getElementById("page-trades")&&!document.getElementById("page-trades").classList.contains("hidden"))renderTrades()})})}).catch(function(){failures++;render()})}
 function loop(){tick().then(function(){setTimeout(loop,document.hidden?8000:2000)})}
 document.addEventListener("visibilitychange",function(){if(!document.hidden)tick()});
 window.addEventListener("resize",function(){if(S)renderMarkets()});
