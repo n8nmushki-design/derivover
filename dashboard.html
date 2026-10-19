@@ -419,14 +419,87 @@ button:disabled{opacity:.45;cursor:not-allowed}
 </section>
 
 <section id="page-strategy" class="page space-y-4">
-  <div class="rounded-xl bg-surface-container border border-outline-variant/20 p-4 lg:p-6">
-    <h2 class="text-base font-semibold mb-1">Bot Strategies</h2>
-    <p class="text-xs text-on-surface-variant mb-6">Both strategies scan every market at the same time. Each keeps its own barrier ladder.</p>
-    <div id="strategyBody" class="grid grid-cols-1 md:grid-cols-2 gap-6"></div>
-  </div>
   <div class="rounded-xl bg-surface-container border border-outline-variant/20 p-4">
-    <h3 class="text-sm font-semibold mb-3">Risk limits</h3>
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 text-sm" id="riskLimits"></div>
+    <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+      <div>
+        <h2 class="text-sm font-semibold">Strategies</h2>
+        <p class="text-[11px] text-on-surface-variant">Demo budget <strong id="stratBudgetLabel">$100</strong> each · run one, two, or all together</p>
+      </div>
+      <div class="flex flex-wrap gap-1.5">
+        <button type="button" data-action="set_active_strategies" data-strategies="all" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-cyan-400/40" style="color:#00E5FF">Run all</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="digits,shark" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Digits+Shark</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="shark,matches" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Shark+Matches</button>
+      </div>
+    </div>
+    <div id="activeStratBar" class="flex flex-wrap gap-2 mb-3"></div>
+    <div class="flex gap-1.5 overflow-x-auto pb-1" id="stratTabs">
+      <button type="button" data-strat-tab="digits" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-primary/40 text-primary">Digits</button>
+      <button type="button" data-strat-tab="shark" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Shark</button>
+      <button type="button" data-strat-tab="matches" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Matches</button>
+      <button type="button" data-strat-tab="run" class="strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-outline-variant/40">Run control</button>
+    </div>
+  </div>
+
+  <!-- Mini: Digits -->
+  <div id="stratMini-digits" class="strat-mini space-y-3">
+    <div class="rounded-xl border border-primary/30 bg-surface-container p-4">
+      <div class="flex items-start justify-between gap-2">
+        <div>
+          <div class="text-sm font-semibold text-primary">Digits Over / Under</div>
+          <p class="text-[11px] text-on-surface-variant mt-1">Dual scanner · DIGITOVER 0 + DIGITUNDER 9 · frequency filter</p>
+        </div>
+        <button type="button" data-action="set_active_strategies" data-strategies="digits" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-primary/40 text-primary">Solo</button>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mt-3" id="miniDigitsStats"></div>
+      <div id="miniDigitsBody" class="mt-3 text-sm text-on-surface-variant">Barrier ladders and live eligibility appear when digits strategy is active.</div>
+    </div>
+  </div>
+
+  <!-- Mini: Shark -->
+  <div id="stratMini-shark" class="strat-mini space-y-3 hidden">
+    <div class="shark-card rounded-xl p-4">
+      <div class="flex items-start justify-between gap-2">
+        <div>
+          <div class="text-sm font-semibold" style="color:#00E5FF">Structure + OB + Shark</div>
+          <p class="text-[11px] text-on-surface-variant mt-1">1H BOS · 15M OB · 5M 0.886 · CALL/PUT on R_75</p>
+        </div>
+        <button type="button" data-action="set_active_strategies" data-strategies="shark" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-cyan-400/40" style="color:#00E5FF">Solo</button>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mt-3" id="miniSharkStats"></div>
+      <div id="miniSharkBody" class="mt-3 text-[12px] text-on-surface-variant">Multi-TF confluence status loads here.</div>
+      <button type="button" data-goto="dashboard" class="mt-3 text-[11px] font-medium" style="color:#00E5FF">Open live Shark chart →</button>
+    </div>
+  </div>
+
+  <!-- Mini: Matches -->
+  <div id="stratMini-matches" class="strat-mini space-y-3 hidden">
+    <div class="rounded-xl border border-violet-400/30 bg-surface-container p-4">
+      <div class="flex items-start justify-between gap-2">
+        <div>
+          <div class="text-sm font-semibold text-violet-300">Digit Matches / Difference</div>
+          <p class="text-[11px] text-on-surface-variant mt-1">DIGITMATCH + DIGITDIFF · V10 1s / V100 1s · hot/cold digit edge</p>
+        </div>
+        <button type="button" data-action="set_active_strategies" data-strategies="matches" class="ctrl-btn px-2.5 py-1 rounded-lg text-[11px] font-semibold border border-violet-400/40 text-violet-300">Solo</button>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mt-3" id="miniMatchesStats"></div>
+      <div id="miniMatchesBody" class="mt-3 text-[12px] text-on-surface-variant">Waiting for digit histogram on 1HZ10V / 1HZ100V…</div>
+    </div>
+  </div>
+
+  <!-- Mini: Run control -->
+  <div id="stratMini-run" class="strat-mini space-y-3 hidden">
+    <div class="rounded-xl bg-surface-container border border-outline-variant/20 p-4">
+      <h3 class="text-sm font-semibold mb-2">Run combination</h3>
+      <p class="text-[11px] text-on-surface-variant mb-3">Toggle which strategies may trade. Each has a $100 demo budget (stops that strategy only when spent).</p>
+      <div class="space-y-2" id="runToggles"></div>
+      <div class="flex flex-wrap gap-2 mt-4">
+        <button type="button" data-action="set_active_strategies" data-strategies="digits" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-outline-variant/40">Only Digits</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="shark" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-outline-variant/40">Only Shark</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="matches" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-outline-variant/40">Only Matches</button>
+        <button type="button" data-action="set_active_strategies" data-strategies="all" class="ctrl-btn px-3 py-2 rounded-lg text-xs font-semibold border border-cyan-400/40" style="color:#00E5FF">All three</button>
+      </div>
+      <div id="runBudgetTable" class="mt-4 overflow-x-auto text-sm"></div>
+    </div>
   </div>
 </section>
 
@@ -741,7 +814,74 @@ function renderTrades(){
 }
 
 function strategyCards(){return(S.strategies||[]).map(function(s){var cur=s.barrier_idx,b=s.barriers;var chips=b.map(function(v,i){return'<span class="chip'+(i===cur?" cur":i<cur?" past":"")+'">'+v+"</span>"}).join("");var next=cur<b.length-1?"After a loss moves to "+b[cur+1]+".":"After a loss resets to "+b[0]+".";return'<div class="rounded-lg bg-surface-container-low p-4 border border-outline-variant/15"><div class="text-[10px] font-mono uppercase text-on-surface-variant mb-1">'+esc(s.label)+' engine</div><div class="text-lg font-semibold mb-2">'+esc(s.kind)+" "+s.barrier+'</div><div class="flex flex-wrap gap-1 mb-2">'+chips+'</div><p class="text-[12px] text-on-surface-variant">'+esc(next)+" A win returns to "+b[0]+".</p></div>"}).join("")}
+
+var stratTab = "digits";
+function showStratTab(id){
+  stratTab = id || "digits";
+  document.querySelectorAll(".strat-tab").forEach(function(b){
+    var on=b.getAttribute("data-strat-tab")===stratTab;
+    b.className = "strat-tab px-3 py-1.5 rounded-lg text-[11px] font-semibold border "+(on?"border-primary/40 text-primary":"border-outline-variant/40");
+  });
+  document.querySelectorAll(".strat-mini").forEach(function(el){el.classList.add("hidden")});
+  var pane=$("stratMini-"+stratTab);
+  if(pane) pane.classList.remove("hidden");
+}
+function renderStrategyPage(){
+  if(!S) return;
+  var budget = S.strategy_budget!=null?S.strategy_budget:100;
+  var bl=$("stratBudgetLabel"); if(bl) bl.textContent="$"+Number(budget).toFixed(0);
+  var active = S.active_strategies || [S.strategy_mode||"shark"];
+  var pnl = S.strategy_pnl || {};
+  var trades = S.strategy_trades || {};
+  var stopped = S.strategy_stopped || {};
+  var bar=$("activeStratBar");
+  if(bar){
+    bar.innerHTML = ["digits","shark","matches"].map(function(m){
+      var on=active.indexOf(m)>=0 && !stopped[m];
+      var left = Math.max(0, budget + Math.min(0, Number(pnl[m]||0)));
+      return '<span class="px-2 py-1 rounded-full text-[10px] font-semibold border '+(on?"border-emerald-400/40 text-emerald-300":"border-outline-variant/30 text-on-surface-variant")+'">'+m+(on?"":" off")+' · $'+left.toFixed(0)+' left</span>';
+    }).join("");
+  }
+  function tile(label,val){
+    return '<div class="rounded-lg border border-outline-variant/20 bg-black/20 p-2"><div class="text-[10px] uppercase text-on-surface-variant">'+label+'</div><div class="text-sm font-semibold">'+val+'</div></div>';
+  }
+  var md=$("miniDigitsStats");
+  if(md) md.innerHTML = tile("P/L", (pnl.digits!=null?(Number(pnl.digits)>=0?"+":"")+Number(pnl.digits).toFixed(2):"0.00"))+tile("Trades", String(trades.digits||0))+tile("Budget left", "$"+Math.max(0,budget+Math.min(0,Number(pnl.digits||0))).toFixed(0));
+  var ms=$("miniSharkStats");
+  if(ms) ms.innerHTML = tile("P/L", (pnl.shark!=null?(Number(pnl.shark)>=0?"+":"")+Number(pnl.shark).toFixed(2):"0.00"))+tile("Trades", String(trades.shark||0))+tile("Budget left", "$"+Math.max(0,budget+Math.min(0,Number(pnl.shark||0))).toFixed(0));
+  var mm=$("miniMatchesStats");
+  if(mm) mm.innerHTML = tile("P/L", (pnl.matches!=null?(Number(pnl.matches)>=0?"+":"")+Number(pnl.matches).toFixed(2):"0.00"))+tile("Trades", String(trades.matches||0))+tile("Budget left", "$"+Math.max(0,budget+Math.min(0,Number(pnl.matches||0))).toFixed(0));
+  var shark=S.shark||{};
+  var mb=$("miniSharkBody");
+  if(mb) mb.textContent = shark.reason || "Waiting for multi-TF confluence…";
+  var match=S.matches||{};
+  var mbody=$("miniMatchesBody");
+  if(mbody){
+    var by=match.by_symbol||{};
+    var lines=Object.keys(by).slice(0,4).map(function(sym){
+      var s=by[sym]; return sym+": ticks "+(s.ticks||0)+(s.ready?(" hot="+s.hot+" cold="+s.cold):" collecting");
+    });
+    mbody.innerHTML = (match.reason||"Collecting digits…")+(lines.length?"<br>"+lines.join("<br>"):"");
+  }
+  var rt=$("runToggles");
+  if(rt){
+    rt.innerHTML=["digits","shark","matches"].map(function(m){
+      var on=active.indexOf(m)>=0;
+      return '<label class="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-outline-variant/20"><span class="text-sm font-medium capitalize">'+m+'</span><button type="button" data-toggle-strat="'+m+'" class="ctrl-btn px-2 py-1 rounded-md text-[11px] font-semibold border '+(on?"border-emerald-400/50 text-emerald-300":"border-outline-variant/40")+'">'+(on?"ON":"OFF")+'</button></label>';
+    }).join("");
+  }
+  var tbl=$("runBudgetTable");
+  if(tbl){
+    tbl.innerHTML='<table class="w-full text-left"><thead><tr class="text-[10px] uppercase text-on-surface-variant"><th class="py-1">Strategy</th><th>P/L</th><th>Trades</th><th>Left</th><th>State</th></tr></thead><tbody>'+
+      ["digits","shark","matches"].map(function(m){
+        var p=Number(pnl[m]||0); var left=Math.max(0,budget+Math.min(0,p));
+        var st=stopped[m]?"budget stop":(active.indexOf(m)>=0?"active":"off");
+        return '<tr class="border-t border-outline-variant/10"><td class="py-1.5 capitalize">'+m+'</td><td class="'+(p>=0?"text-emerald-400":"text-error")+'">'+(p>=0?"+":"")+p.toFixed(2)+'</td><td>'+(trades[m]||0)+'</td><td>$'+left.toFixed(0)+'</td><td>'+st+'</td></tr>';
+      }).join("")+'</tbody></table>';
+  }
+}
 function renderStrategy(){
+
   var mode=(S&&S.strategy_mode)||"digits";
   var shark=S&&S.shark?S.shark:{};
   var picker='<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-4 mb-4">'+
@@ -1124,7 +1264,7 @@ function applyModeTheme(){
     // keep structure; subtitle via sibling if any
   }
 }
-function render(){applyModeTheme();renderHeader();renderAlerts();renderAge();updateControlUI();renderOverview();renderQuickActions();if(!S)return;renderBalance();renderStats();renderMarkets();renderTrades();renderStrategy();renderEvents();if((S.strategy_mode||"shark")==="shark"){drawSharkChart();renderSharkTradeHist()}}
+function render(){applyModeTheme();renderHeader();renderAlerts();renderAge();updateControlUI();renderOverview();renderQuickActions();if(!S)return;renderBalance();renderStats();renderMarkets();renderTrades();renderStrategy();renderStrategyPage();renderEvents();if((S.strategy_mode||"shark")==="shark"){drawSharkChart();renderSharkTradeHist()}}
 
 /* ----- auto-trade controls ----- */
 function setCtrlMsg(msg, ok){
@@ -1220,7 +1360,25 @@ document.addEventListener("click",function(e){
     var a=act.getAttribute("data-action");
     var extra={};
     if(act.getAttribute("data-mode"))extra.mode=act.getAttribute("data-mode");
+    if(act.getAttribute("data-strategies"))extra.strategies=act.getAttribute("data-strategies");
     sendControl(a, extra);
+    return;
+  }
+  var stab=t.closest("[data-strat-tab]");
+  if(stab){
+    e.preventDefault();
+    showStratTab(stab.getAttribute("data-strat-tab"));
+    return;
+  }
+  var tgl=t.closest("[data-toggle-strat]");
+  if(tgl){
+    e.preventDefault();
+    var m=tgl.getAttribute("data-toggle-strat");
+    var active=(S&&S.active_strategies)?S.active_strategies.slice():[];
+    var i=active.indexOf(m);
+    if(i>=0) active.splice(i,1); else active.push(m);
+    if(!active.length) active=[m];
+    sendControl("set_active_strategies",{strategies:active.join(",")});
     return;
   }
   // Chart timeframe (Shark) — must not use data-tf (trade filters)

@@ -602,6 +602,13 @@ class Bot:
             "last_error": None,
             "currency": "USD",
             "strategy_mode": "digits",
+            "active_strategies": None,
+            "strategy_budget": 100.0,
+            "strategy_pnl": None,
+            "strategy_trades": None,
+            "strategy_stopped": None,
+            "matches": None,
+            "matches_status": {},
             "shark": None,
             "shark_status": {},
             "_pending_shark_signal": None,
@@ -1193,6 +1200,54 @@ class Bot:
             }))
             return
 
+        # ---- Digit Matches / Difference ----
+        if key == "matches":
+            pending = getattr(self, "_pending_match_signals", None) or []
+            sig = None
+            for s in pending:
+                if getattr(s, "symbol", None) == symbol:
+                    sig = s
+                    break
+            if not sig:
+                return
+            # consume this signal
+            self._pending_match_signals = [s for s in pending if s is not sig]
+            ctype = sig.contract_type
+            barrier = str(sig.digit)
+            print(f"\n★ MATCHES {symbol} {ctype} digit={barrier} – {sig.reason}")
+            if not TRADING_ENABLED:
+                print("  [signals only] TRADING_ENABLED=False")
+                return
+            self.pending = True
+            self.pending_since = time.time()
+            self.pending_trade = {
+                "symbol": symbol,
+                "contract_type": ctype,
+                "barrier": int(sig.digit),
+                "strategy": "matches",
+                "side": sig.side,
+                "setup_meta": sig.meta,
+                "strategy_mode": "matches",
+            }
+            self.manual_symbol = None
+            self.manual_strategy = None
+            self.manual_skip_filter = False
+            ws.send(json.dumps({
+                "buy": 1,
+                "price": STAKE,
+                "parameters": {
+                    "amount": STAKE,
+                    "basis": "stake",
+                    "contract_type": ctype,
+                    "currency": self.currency,
+                    "duration": 1,
+                    "duration_unit": "t",
+                    "underlying_symbol": symbol,
+                    "barrier": barrier,
+                },
+            }))
+            return
+
         s       = STRATEGIES[key]
         barrier = str(self.current_barrier(key))
         ctype   = s["contract"]
@@ -1434,7 +1489,7 @@ class Bot:
                                                    account_id=ACCOUNT.get("id"))
                     except Exception:
                         pass
-            if getattr(self, "strategy_mode", "digits") == "digits" or symbol == SHARK_SYMBOL:
+            if self.strategy_active("digits") or self.strategy_active("shark") or self.strategy_active("matches"):
                 self.try_trade(ws, symbol, price)
 
         # ---- balance ----
@@ -1574,8 +1629,18 @@ class Bot:
                 except Exception as e:
                     print(f"[supabase] save close trade: {e}", flush=True)
 
-            # Only the strategy that placed this trade moves its own barrier ladder.
+            # Attribute P/L to strategy budget; only digit strategies move barrier ladders.
             key = (rec or {}).get("strategy") or self.open_strategy
+            mode = (rec.get("strategy_mode") if rec else None) or key or "digits"
+            if mode in ("over", "under"):
+                mode = "digits"
+            if mode not in self.strategy_pnl:
+                self.strategy_pnl[mode] = 0.0
+            self.strategy_pnl[mode] = round(self.strategy_pnl.get(mode, 0.0) + profit, 2)
+            self.strategy_trades[mode] = int(self.strategy_trades.get(mode, 0)) + 1
+            if self.strategy_pnl[mode] <= -float(getattr(self, "strategy_budget", 100.0)):
+                self.strategy_stopped[mode] = True
+                self.note("warn", f"{mode} budget ${self.strategy_budget:.0f} spent — strategy paused")
             if key in STRATEGIES:
                 if profit > 0:
                     self.on_win(key)
