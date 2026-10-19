@@ -153,20 +153,38 @@ class SharkEngine:
         return (b["l"], b["h"])
 
     def _bos(self, bars: List[dict]) -> Optional[str]:
-        if len(bars) < 20:
+        """Strict HH+HL / LH+LL, else soft close-structure bias so UI always has a side."""
+        if len(bars) < 15:
             return None
         highs = [b["h"] for b in bars]
         lows = [b["l"] for b in bars]
+        closes = [b["c"] for b in bars]
         sh = self._swing_highs(highs)
         sl = self._swing_lows(lows)
-        if len(sh) < 2 or len(sl) < 2:
-            return None
-        last_sh, prev_sh = sh[-1], sh[-2]
-        last_sl, prev_sl = sl[-1], sl[-2]
-        if highs[last_sh] > highs[prev_sh] and lows[last_sl] > lows[prev_sl]:
-            return "bullish"
-        if highs[last_sh] < highs[prev_sh] and lows[last_sl] < lows[prev_sl]:
-            return "bearish"
+        # Strict BOS
+        if len(sh) >= 2 and len(sl) >= 2:
+            last_sh, prev_sh = sh[-1], sh[-2]
+            last_sl, prev_sl = sl[-1], sl[-2]
+            if highs[last_sh] > highs[prev_sh] and lows[last_sl] > lows[prev_sl]:
+                return "bullish"
+            if highs[last_sh] < highs[prev_sh] and lows[last_sl] < lows[prev_sl]:
+                return "bearish"
+        # Soft: last swing break
+        if len(sh) >= 1 and len(sl) >= 1:
+            if closes[-1] > highs[sh[-1]] * 0.999:
+                return "bullish"
+            if closes[-1] < lows[sl[-1]] * 1.001:
+                return "bearish"
+        # Fallback: slope of closes
+        window = closes[-20:] if len(closes) >= 20 else closes
+        if len(window) >= 8:
+            mid = len(window) // 2
+            a = sum(window[:mid]) / mid
+            b = sum(window[mid:]) / (len(window) - mid)
+            if b > a * 1.0002:
+                return "bullish"
+            if b < a * 0.9998:
+                return "bearish"
         return None
 
     # ---------- multi-TF evaluate ----------
@@ -188,6 +206,7 @@ class SharkEngine:
         # Filter 1 — 1H structure bias
         bias = self._bos(h1)
         self.bias = bias
+        # Always refresh levels (BOS on all TFs) even while waiting for confluence
         if not bias:
             self.last_eval_reason = "1H: no clear BOS — wait"
             self._publish_levels(m5, m15, bias=None)
@@ -300,6 +319,12 @@ class SharkEngine:
         self.last_signal = sig
         self.last_eval_reason = sig.reason
         self.targets = {"entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "side": sig.side}
+        self.levels = dict(self.levels or {})
+        self.levels["sl"] = sl
+        self.levels["entry"] = price
+        self.levels["tp1"] = tp1
+        self.levels["tp2"] = tp2
+        self.levels["bos"] = sig.meta.get("bos") if sig.meta else self.bias
         return sig
 
     def _publish_levels(self, m5, m15, **kw):
@@ -353,7 +378,7 @@ class SharkEngine:
                 "1m": n(60), "5m": n(TF_ENTRY), "15m": n(TF_SETUP), "1h": n(TF_BIAS),
             },
             "reason": self.last_eval_reason,
-            "bias": self.bias,
+            "bias": self.bias or (self.levels or {}).get("bos_1h"),
             "bos_1h": (self.levels or {}).get("bos_1h") or self.bias,
             "bos_15m": (self.levels or {}).get("bos_15m"),
             "bos_5m": (self.levels or {}).get("bos_5m"),

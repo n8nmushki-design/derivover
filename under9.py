@@ -1388,6 +1388,50 @@ class Bot:
                 return "under"
         return None
 
+
+    def _manage_shark_exits(self, ws, price: float) -> None:
+        """Sell Shark legs when price hits TP1 (50%), TP2 (rest), or SL."""
+        legs = getattr(self, "open_shark_legs", None) or []
+        if not legs:
+            return
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            return
+        remain = []
+        for leg in legs:
+            if leg.get("sold"):
+                continue
+            side = leg.get("side")  # buy | sell
+            tp = leg.get("tp_price")
+            sl = leg.get("sl")
+            hit = False
+            reason = ""
+            if side == "buy":
+                if tp is not None and px >= float(tp):
+                    hit, reason = True, f"TP {leg.get('leg')}"
+                elif sl is not None and px <= float(sl):
+                    hit, reason = True, "SL"
+            elif side == "sell":
+                if tp is not None and px <= float(tp):
+                    hit, reason = True, f"TP {leg.get('leg')}"
+                elif sl is not None and px >= float(sl):
+                    hit, reason = True, "SL"
+            if hit and leg.get("contract_id"):
+                try:
+                    ws.send(json.dumps({
+                        "sell": leg["contract_id"],
+                        "price": 0,  # market sell at indicative
+                    }))
+                    leg["sold"] = True
+                    self.note("info", f"Shark exit {reason}: sold {leg['contract_id']} @ {px:.2f}")
+                except Exception as e:
+                    print(f"[shark] sell failed: {e}", flush=True)
+                    remain.append(leg)
+            else:
+                remain.append(leg)
+        self.open_shark_legs = remain
+
     def try_trade(self, ws, symbol: str, price: float):
         key = self.can_trade(symbol)
         if key is None:
@@ -1763,6 +1807,11 @@ class Bot:
                       f"Under {self.current_barrier('under')})")
                 self.last_status[symbol] = status_key
 
+
+            # Managed Shark exits: sell leg at TP1 / TP2 / SL
+            if getattr(self, "open_shark_legs", None) and symbol == SHARK_SYMBOL:
+                self._manage_shark_exits(ws, price)
+
             # Shark mode: evaluate structure/OB/0.886 on configured symbol
             shark_eng = getattr(self, "shark", None)
             if bot_strategy_active(self, "shark") and symbol == SHARK_SYMBOL:
@@ -1841,6 +1890,15 @@ class Bot:
         elif t == "buy":
             buy = msg.get("buy") or {}
             contract_id = buy.get("contract_id")
+            # Buy error (no contract)
+            if not contract_id and msg.get("error"):
+                err = (msg.get("error") or {}).get("message") or str(msg.get("error"))
+                self.pending = False
+                self.pending_trade = None
+                self.last_error = f"Buy failed: {err}"
+                self.note("error", self.last_error[:220])
+                self._shark_buy_queue = []
+                return
             self.trades += 1
             self.pending = False
             self.last_trade_ts = time.time()
@@ -1851,27 +1909,60 @@ class Bot:
             self.pending_trade = None
             strategy = pt.get("strategy") or "over"
             self.open_strategy = strategy
-            print(f"Trade #{self.trades} placed  ({STRATEGIES[strategy]['label']})  "
+            label = (
+                STRATEGIES[strategy]["label"] if strategy in STRATEGIES
+                else (pt.get("strategy_mode") or strategy or "trade")
+            )
+            print(f"Trade #{self.trades} placed  ({label})  "
                   f"contract_id={contract_id}  barrier={pt.get('barrier')}")
             try:
-                stake = float(buy.get("buy_price") or STAKE)
+                stake = float(buy.get("buy_price") or pt.get("stake") or STAKE)
             except (TypeError, ValueError):
-                stake = STAKE
+                stake = float(pt.get("stake") or STAKE)
+            ctype = pt.get("contract_type")
+            if not ctype and strategy in STRATEGIES:
+                ctype = STRATEGIES[strategy]["contract"]
+            barrier = pt.get("barrier")
+            if barrier is None and strategy in STRATEGIES:
+                try:
+                    barrier = self.current_barrier(strategy)
+                except Exception:
+                    barrier = None
             rec = {
                 "n": self.trades, "contract_id": contract_id,
                 "symbol": pt.get("symbol", "?"),
-                "contract_type": pt.get("contract_type", STRATEGIES[strategy]["contract"]),
-                "barrier": pt.get("barrier", self.current_barrier(strategy)),
+                "contract_type": ctype,
+                "barrier": barrier,
                 "strategy": strategy,
                 "strategy_mode": pt.get("strategy_mode") or getattr(self, "strategy_mode", "digits"),
                 "side": pt.get("side"),
                 "setup_meta": pt.get("setup_meta") or {},
+                "shark_leg": pt.get("shark_leg"),
                 "stake": stake, "status": "open", "profit": None,
                 "t_open": time.time(), "t_close": None,
             }
             self.trade_log.append(rec)
-            kind = "Over" if rec["contract_type"] == "DIGITOVER" else "Under"
-            self.note("info", f"Trade #{rec['n']} placed: {rec['symbol']} {kind} {rec['barrier']}")
+            # Track Shark legs for TP1/TP2 scale-out
+            if (pt.get("strategy_mode") == "shark" or strategy == "shark") and contract_id:
+                if not hasattr(self, "open_shark_legs") or self.open_shark_legs is None:
+                    self.open_shark_legs = []
+                meta = pt.get("setup_meta") or {}
+                self.open_shark_legs.append({
+                    "contract_id": contract_id,
+                    "leg": pt.get("shark_leg") or "full",
+                    "side": pt.get("side"),
+                    "symbol": pt.get("symbol") or SHARK_SYMBOL,
+                    "entry": meta.get("entry"),
+                    "tp1": meta.get("tp1"),
+                    "tp2": meta.get("tp2") if (pt.get("shark_leg") == "tp2") else meta.get("tp1"),
+                    "tp_price": pt.get("tp_price") or (
+                        meta.get("tp2") if pt.get("shark_leg") == "tp2" else meta.get("tp1")
+                    ),
+                    "sl": meta.get("sl"),
+                    "sold": False,
+                })
+            kind = rec.get("contract_type") or "?"
+            self.note("info", f"Trade #{rec['n']} placed: {rec['symbol']} {kind} leg={pt.get('shark_leg') or '-'}")
             try:
                 store = _supa()
                 if store:
@@ -1890,6 +1981,39 @@ class Bot:
                     "proposal_open_contract": 1,
                     "contract_id": contract_id,
                     "subscribe": 1,
+                }))
+            # Place second Shark leg (TP2 half) if queued
+            q = getattr(self, "_shark_buy_queue", None) or []
+            if q:
+                nxt = q.pop(0)
+                self._shark_buy_queue = q
+                self.pending = True
+                self.pending_since = time.time()
+                self.pending_trade = {
+                    "symbol": nxt["symbol"],
+                    "contract_type": nxt["contract_type"],
+                    "barrier": None,
+                    "strategy": "shark",
+                    "side": nxt.get("side"),
+                    "setup_meta": nxt.get("setup_meta") or {},
+                    "strategy_mode": "shark",
+                    "shark_leg": nxt.get("shark_leg") or "tp2",
+                    "stake": nxt.get("stake") or (STAKE * 0.5),
+                    "tp_price": nxt.get("tp_price"),
+                }
+                ws.send(json.dumps({
+                    "buy": 1,
+                    "price": nxt.get("stake") or (STAKE * 0.5),
+                    "parameters": {
+                        "amount": nxt.get("stake") or (STAKE * 0.5),
+                        "basis": "stake",
+                        "contract_type": nxt["contract_type"],
+                        "currency": self.currency or "USD",
+                        "duration": nxt.get("duration") or SHARK_DURATION_MINUTES,
+                        "duration_unit": nxt.get("duration_unit") or "m",
+                        "symbol": nxt["symbol"],
+                        "underlying_symbol": nxt["symbol"],
+                    },
                 }))
 
         # ---- contract result ----
@@ -1946,6 +2070,13 @@ class Bot:
                 else:
                     self.on_loss(key)
 
+            cid = None
+            try:
+                cid = (rec or {}).get("contract_id") or (poc.get("contract_id") if isinstance(poc, dict) else None)
+            except Exception:
+                cid = None
+            if cid and getattr(self, "open_shark_legs", None):
+                self.open_shark_legs = [L for L in self.open_shark_legs if L.get("contract_id") != cid]
             self.open_contract = None
             self.open_strategy = None
 

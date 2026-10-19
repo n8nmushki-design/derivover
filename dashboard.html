@@ -1349,7 +1349,7 @@ function renderLiveTargets(targets, levels){
   var items=[
     ["Side", String(side).toUpperCase()],
     ["Entry", targets.entry!=null?Number(targets.entry).toFixed(2):(levels.price!=null?Number(levels.price).toFixed(2):"—")],
-    ["SL", targets.sl!=null?Number(targets.sl).toFixed(2):"—"],
+    ["SL", (targets.sl!=null?Number(targets.sl):(levels.sl!=null?Number(levels.sl):null))!=null?Number(targets.sl!=null?targets.sl:levels.sl).toFixed(2):"—"],
     ["TP1 0.5", (targets.tp1||levels.tp1)!=null?Number(targets.tp1||levels.tp1).toFixed(2):"—"],
     ["TP2 0.886", (targets.tp2||levels.tp2)!=null?Number(targets.tp2||levels.tp2).toFixed(2):"—"]
   ];
@@ -1361,14 +1361,24 @@ function renderSharkLevelsPanel(levels, targets, shark){
   var lv=$("sharkLevels");
   if(!lv)return;
   levels=levels||{}; targets=targets||{}; shark=shark||{};
+  function bos(v){
+    if(!v||v==="—")return "—";
+    var s=String(v);
+    return s.charAt(0).toUpperCase()+s.slice(1);
+  }
   var items=[
-    ["1H Bias", levels.bos||shark.bias||"—"],
+    ["1H BOS", bos(levels.bos_1h||levels.bos||shark.bos_1h||shark.bias)],
+    ["15M BOS", bos(levels.bos_15m||shark.bos_15m)],
+    ["5M BOS", bos(levels.bos_5m||shark.bos_5m)],
     ["15M Mid 0.5", levels.mid!=null?Number(levels.mid).toFixed(2):"—"],
     ["5M Shark 0.886", levels.fib_886!=null?Number(levels.fib_886).toFixed(2):"—"],
-    ["OB zone", (levels.ob_lo!=null&&levels.ob_hi!=null)?(Number(levels.ob_lo).toFixed(1)+"–"+Number(levels.ob_hi).toFixed(1)):"—"]
+    ["OB zone", (levels.ob_lo!=null&&levels.ob_hi!=null)?(Number(levels.ob_lo).toFixed(1)+"–"+Number(levels.ob_hi).toFixed(1)):"—"],
+    ["SL", (targets.sl!=null||levels.sl!=null)?Number(targets.sl!=null?targets.sl:levels.sl).toFixed(2):"—"],
+    ["Plan", (targets.side||levels.bos||"—")+""]
   ];
   lv.innerHTML=items.map(function(it){
-    return '<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-3"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+it[0]+'</div><div class="text-sm font-semibold mt-0.5">'+it[1]+'</div></div>';
+    var col=(String(it[1]).toLowerCase().indexOf("bull")>=0)?"text-emerald-400":(String(it[1]).toLowerCase().indexOf("bear")>=0||String(it[1]).toLowerCase()==="sell"?"text-error":"");
+    return '<div class="rounded-xl border border-outline-variant/20 bg-surface-container p-3"><div class="text-[10px] font-mono uppercase text-on-surface-variant">'+it[0]+'</div><div class="text-sm font-semibold mt-0.5 '+col+'">'+it[1]+'</div></div>';
   }).join("");
 }
 
