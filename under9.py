@@ -112,6 +112,9 @@ DEFAULT_STRATEGY_MODE = (os.environ.get("STRATEGY_MODE", "shark") or "shark").st
 if DEFAULT_STRATEGY_MODE not in STRATEGY_MODES:
     DEFAULT_STRATEGY_MODE = "shark"
 SHARK_SYMBOL = (os.environ.get("SHARK_SYMBOL", "R_75") or "R_75").strip()
+V75_SYMBOLS = ["R_75", "1HZ75V"]
+if SHARK_SYMBOL not in V75_SYMBOLS:
+    V75_SYMBOLS = [SHARK_SYMBOL] + [s for s in ("R_75", "1HZ75V") if s != SHARK_SYMBOL]
 try:
     SHARK_DURATION_TICKS = int(os.environ.get("SHARK_DURATION_TICKS", "5") or 5)
 except ValueError:
@@ -583,12 +586,12 @@ class Bot:
             return {"ok": True, "message": f"Started {mode} strategy"}
         if action in ("set_chart_symbol", "chart_symbol"):
             sym = (kwargs.get("symbol") or kwargs.get("mode") or "").strip()
-            if sym not in V75_SYMBOLS and sym not in CANDIDATE_SYMBOLS:
+            v75 = list(globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"]))
+            if sym not in v75 and sym not in CANDIDATE_SYMBOLS:
                 return {"ok": False, "message": f"Unknown symbol {sym}"}
             with self.lock:
                 self.chart_symbol = sym
-            # Optional: switch shark primary if V75
-            if sym in V75_SYMBOLS:
+            if sym in v75:
                 # keep trading symbol as SHARK_SYMBOL; chart can differ
                 pass
             self.note("info", f"Chart symbol → {sym}")
@@ -789,7 +792,7 @@ class Bot:
                 "shark": (getattr(self, "shark").status() if getattr(self, "shark", None) else {"reason": "unavailable"}),
                 "chart": {
                     "symbol": getattr(self, "chart_symbol", None) or SHARK_SYMBOL,
-                    "v75_symbols": list(V75_SYMBOLS),
+                    "v75_symbols": list(globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"])),
                     "points": list((getattr(self, "price_history", None) or {}).get(SHARK_SYMBOL, []))[-180:]
                     if getattr(self, "price_history", None) is not None
                     else [],
@@ -1407,18 +1410,19 @@ def run_session(bot: Bot):
         ws.send(json.dumps({"ticks": sym, "subscribe": 1}))
         print(f"  subscribed: {sym}")
 
-    # Multi-TF candles for Shark (1H bias, 15M setup, 5M entry + 1M chart)
-    for gran, label in ((60, "1M"), (300, "5M"), (900, "15M"), (3600, "1H")):
-        ws.send(json.dumps({
-            "ticks_history": SHARK_SYMBOL,
-            "adjust_start_time": 1,
-            "count": 120,
-            "end": "latest",
-            "granularity": gran,
-            "style": "candles",
-            "subscribe": 1,
-        }))
-        print(f"  candles: {SHARK_SYMBOL} {label} ({gran}s)")
+    # Multi-TF candles for all V75 feeds (1H bias, 15M setup, 5M entry)
+    for sym in V75_SYMBOLS:
+        for gran, label in ((300, "5M"), (900, "15M"), (3600, "1H")):
+            ws.send(json.dumps({
+                "ticks_history": sym,
+                "adjust_start_time": 1,
+                "count": 150,
+                "end": "latest",
+                "granularity": gran,
+                "style": "candles",
+                "subscribe": 1,
+            }))
+            print(f"  candles: {sym} {label} ({gran}s)")
 
     print(f"\nMode: {ACCOUNT_TYPE} | trading={'ON' if TRADING_ENABLED else 'OFF'}")
     print("Strategies: OVER (Over 0) and UNDER (Under 9), scanned at the same time")
