@@ -43,6 +43,32 @@ import urllib.error
 import urllib.request
 from collections import defaultdict, deque
 
+# Optional Supabase persistence (never hard-fail if missing)
+try:
+    from supabase_store import STORE as SUPA
+except Exception:
+    SUPA = None  # type: ignore
+
+try:
+    from strategy_shark import SharkEngine
+except Exception as _shark_imp_err:
+    SharkEngine = None  # type: ignore
+    print(f"[shark] strategy_shark import failed: {_shark_imp_err}", flush=True)
+
+try:
+    from strategy_matches import MatchEngine, MATCH_SYMBOLS
+except Exception as _match_imp_err:
+    MatchEngine = None  # type: ignore
+    MATCH_SYMBOLS = ("1HZ10V", "1HZ100V", "R_10", "R_100")
+    print(f"[matches] strategy_matches import failed: {_match_imp_err}", flush=True)
+
+try:
+    from strategy_nextdigit import NextDigitEngine, NEXT_DIGIT_SYMBOLS
+except Exception as _nd_imp_err:
+    NextDigitEngine = None  # type: ignore
+    NEXT_DIGIT_SYMBOLS = ("1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V", "R_10", "R_25", "R_50", "R_75", "R_100")
+    print(f"[nextdigit] strategy_nextdigit import failed: {_nd_imp_err}", flush=True)
+
 from websocket import (
     create_connection,
     WebSocketTimeoutException,
@@ -62,6 +88,7 @@ STAKE             = 1.0
 DURATION_TICKS    = 1
 COOLDOWN_SECONDS  = 3
 MAX_TRADES        = 50
+TRADE_LIMIT_REFRESH_SECS = 300   # wait this long AFTER limit is hit, then auto-reset
 STOP_LOSS         = 3.0
 TAKE_PROFIT       = 7.5
 
@@ -93,6 +120,28 @@ MAX_01_FREQUENCY     = 0.10
 MAX_89_FREQUENCY     = 0.10
 MIN_TICKS_FOR_FILTER = 50
 
+# Strategy modes
+STRATEGY_MODES = ("digits", "shark", "matches", "nextdigit")
+DEFAULT_STRATEGY_MODE = (os.environ.get("STRATEGY_MODE", "shark") or "shark").strip().lower()
+if DEFAULT_STRATEGY_MODE not in STRATEGY_MODES:
+    DEFAULT_STRATEGY_MODE = "shark"
+_raw_active = (os.environ.get("ACTIVE_STRATEGIES", DEFAULT_STRATEGY_MODE) or DEFAULT_STRATEGY_MODE).strip().lower()
+if _raw_active in ("all", "*"):
+    DEFAULT_ACTIVE_STRATEGIES = list(STRATEGY_MODES)
+else:
+    DEFAULT_ACTIVE_STRATEGIES = [s.strip() for s in _raw_active.split(",") if s.strip() in STRATEGY_MODES]
+    if not DEFAULT_ACTIVE_STRATEGIES:
+        DEFAULT_ACTIVE_STRATEGIES = [DEFAULT_STRATEGY_MODE]
+STRATEGY_BUDGET = float(os.environ.get("STRATEGY_BUDGET", "100") or 100)
+SHARK_SYMBOL = (os.environ.get("SHARK_SYMBOL", "R_75") or "R_75").strip()
+V75_SYMBOLS = ["R_75", "1HZ75V"]
+if SHARK_SYMBOL not in V75_SYMBOLS:
+    V75_SYMBOLS = [SHARK_SYMBOL] + [s for s in ("R_75", "1HZ75V") if s != SHARK_SYMBOL]
+try:
+    SHARK_DURATION_TICKS = int(os.environ.get("SHARK_DURATION_TICKS", "5") or 5)
+except ValueError:
+    SHARK_DURATION_TICKS = 5
+
 # Both strategies are active at once.
 STRATEGIES = {
     "over":  {"label": "Over 0",  "kind": "Over",  "contract": "DIGITOVER",
@@ -104,6 +153,32 @@ STRATEGIES = {
 
 def clean(s: str) -> str:
     return "".join(c for c in s if 33 <= ord(c) <= 126)
+
+def normalize_candle_rows(rows, granularity=None):
+    """Clean OHLC rows: seconds epoch, valid OHLC, dedupe, sort."""
+    by_t = {}
+    gran = int(granularity) if granularity else None
+    for r in rows or []:
+        try:
+            t = int(r.get("epoch") or r.get("t") or 0)
+            if t > 10_000_000_000:  # ms → sec
+                t = t // 1000
+            if t <= 0:
+                continue
+            if gran:
+                t = (t // gran) * gran
+            o = float(r.get("open", r.get("o")))
+            h = float(r.get("high", r.get("h")))
+            l = float(r.get("low", r.get("l")))
+            c = float(r.get("close", r.get("c")))
+            if min(o, h, l, c) <= 0:
+                continue
+            h = max(h, o, c)
+            l = min(l, o, c)
+            by_t[t] = {"t": t, "o": o, "h": h, "l": l, "c": c}
+        except (TypeError, ValueError, KeyError):
+            continue
+    return [by_t[k] for k in sorted(by_t.keys())]
 
 APP_ID = clean(APP_ID)
 TOKEN  = clean(TOKEN)
@@ -180,6 +255,10 @@ def find_wss(obj):
 
 # The account the bot is trading on (shown on the dashboard).
 ACCOUNT = {"id": None, "type": ACCOUNT_TYPE}
+
+def _supa():
+    """Return Supabase store or None (never raises NameError)."""
+    return globals().get("SUPA")
 
 def account_id_of(a: dict):
     for key in ("account_id", "accountId", "id", "loginid"):
@@ -259,6 +338,36 @@ def decimals_needed(price) -> int:
     s = f"{float(price):.8f}".rstrip("0")
     return len(s.split(".")[1]) if "." in s else 0
 
+
+def bot_strategy_active(bot, name: str) -> bool:
+    """Safe multi-strategy gate (never AttributeError)."""
+    try:
+        fn = getattr(bot, "strategy_active", None)
+        if callable(fn):
+            return bool(fn(name))
+    except Exception:
+        pass
+    stopped = getattr(bot, "strategy_stopped", None) or {}
+    if stopped.get(name):
+        return False
+    active = getattr(bot, "active_strategies", None)
+    if not active:
+        active = [getattr(bot, "strategy_mode", "digits") or "digits"]
+    return name in active
+
+
+def bot_strategy_budget_left(bot, name: str) -> float:
+    try:
+        fn = getattr(bot, "strategy_budget_left", None)
+        if callable(fn):
+            return float(fn(name))
+    except Exception:
+        pass
+    pnl = float((getattr(bot, "strategy_pnl", None) or {}).get(name, 0.0) or 0.0)
+    budget = float(getattr(bot, "strategy_budget", 100.0) or 100.0)
+    return max(0.0, budget + min(0.0, pnl))
+
+
 class Bot:
     def __init__(self):
         self.idx             = {"over": 0, "under": 0}   # barrier ladder position per strategy
@@ -282,6 +391,7 @@ class Bot:
         self.events          = deque(maxlen=100)     # newest first
         self.trade_log       = deque(maxlen=500)     # oldest first
         self.balance_history = deque(maxlen=300)     # [timestamp, balance]
+        self.price_history = defaultdict(lambda: deque(maxlen=240))  # symbol -> [t, price]
         self.last_price      = {}                    # symbol -> latest quote
         self.pending_trade   = None                  # trade waiting for its buy confirmation
         self.pending_since   = 0.0
@@ -297,6 +407,332 @@ class Bot:
         self.manual_symbol   = None                  # optional one-shot force symbol
         self.manual_strategy = None                  # "over" | "under" | None (auto)
         self.manual_skip_filter = False              # manual trade: ignore digit filter once
+        self.strategy_mode = DEFAULT_STRATEGY_MODE
+        self.active_strategies = list(DEFAULT_ACTIVE_STRATEGIES)
+        self.strategy_budget = float(STRATEGY_BUDGET)
+        self.strategy_pnl = {m: 0.0 for m in STRATEGY_MODES}
+        self.strategy_trades = {m: 0 for m in STRATEGY_MODES}
+        self.strategy_stopped = {m: False for m in STRATEGY_MODES}
+        self.shark = None
+        self.shark_status = {}
+        self.matches = None
+        self.matches_status = {}
+        self.nextdigit = None
+        self.nextdigit_status = {}
+        self._pending_shark_signal = None
+        self._pending_match_signals = []
+        self._pending_nextdigit_signal = None
+        try:
+            self.ensure_shark()
+        except Exception:
+            self.shark = None
+        try:
+            self.ensure_matches()
+        except Exception:
+            self.matches = None
+        try:
+            self.ensure_nextdigit()
+        except Exception:
+            self.nextdigit = None
+        self.trades_window_started = time.time()     # session start (legacy)
+        self.limit_hit_at = None                     # set only when MAX_TRADES is hit
+        self.limit_refresh_count = 0                 # how many times limit was refreshed
+
+
+    def load_candles_from_supabase(self) -> int:
+        """Prefill chart memory from Supabase (fast path on boot)."""
+        store = _supa()
+        if not store or not getattr(store, "enabled", False) or not hasattr(store, "list_candles"):
+            return 0
+        total = 0
+        if not hasattr(self, "v75_candles") or self.v75_candles is None:
+            self.v75_candles = {}
+        for sym in globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"]):
+            for gran in (300, 900, 3600):
+                try:
+                    rows = store.list_candles(
+                        symbol=sym,
+                        granularity=gran,
+                        limit=5000,
+                        account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                    )
+                    rows = normalize_candle_rows(rows, gran)
+                    if rows:
+                        self.v75_candles.setdefault(sym, {})[str(gran)] = rows[-5000:]
+                        total += len(rows)
+                        if sym == SHARK_SYMBOL:
+                            eng = self.ensure_shark()
+                            if eng is not None:
+                                eng.set_candles(gran, rows[-200:])
+                except Exception as e:
+                    print(f"[supabase] list_candles {sym}/{gran}: {e}", flush=True)
+        if total:
+            self.note("info", f"Loaded {total} candles from Supabase into chart")
+        return total
+
+    def fetch_v75_history(self, years: float = 1.0, symbols=None, granularities=None) -> dict:
+        """
+        Manual backfill: pull ~1y of V75 OHLC from Deriv (paginated) into
+        memory + Supabase. Runs in a background thread.
+        """
+        if self.history_job and self.history_job.get("status") == "running":
+            return {"ok": False, "message": "History load already running"}
+        symbols = list(symbols or globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"]))
+        granularities = list(granularities or [300, 900, 3600])
+        self.history_job = {
+            "status": "running",
+            "progress": 0,
+            "message": "Starting V75 history load…",
+            "saved": 0,
+        }
+
+        def worker():
+            import math
+            try:
+                now = int(time.time())
+                start_floor = now - int(years * 365.25 * 24 * 3600)
+                total_steps = max(1, len(symbols) * len(granularities) * 8)
+                step = 0
+                saved = 0
+                # Always use a dedicated socket (never share bot._ws — recv race)
+                try:
+                    url = get_ws_url()
+                    ws = create_connection(url, timeout=25, header=["User-Agent: " + UA])
+                    ws.settimeout(25)
+                    own_ws = True
+                except Exception as e:
+                    self.history_job = {
+                        "status": "error",
+                        "progress": 0,
+                        "message": f"Cannot open WebSocket: {e}",
+                        "saved": 0,
+                    }
+                    return
+
+                BATCH = 2000  # Deriv-safe page size
+                if not hasattr(self, "v75_candles") or self.v75_candles is None:
+                    self.v75_candles = {}
+
+                for sym in symbols:
+                    for gran in granularities:
+                        end = now
+                        series = []
+                        pages = 0
+                        max_pages = 40  # safety cap
+                        while end > start_floor and pages < max_pages:
+                            req = {
+                                "ticks_history": sym,
+                                "adjust_start_time": 1,
+                                "count": BATCH,
+                                "end": end,
+                                "granularity": int(gran),
+                                "style": "candles",
+                            }
+                            try:
+                                ws.send(json.dumps(req))
+                                raw = ws.recv()
+                                msg = json.loads(raw)
+                            except Exception as e:
+                                self.history_job = {
+                                    "status": "error",
+                                    "progress": int(100 * step / total_steps),
+                                    "message": f"WS error {sym}/{gran}: {e}",
+                                    "saved": saved,
+                                }
+                                if own_ws:
+                                    try:
+                                        ws.close()
+                                    except Exception:
+                                        pass
+                                return
+                            if "error" in msg:
+                                # stop this series, continue others
+                                break
+                            rows = msg.get("candles") or []
+                            if not rows:
+                                break
+                            cleaned = normalize_candle_rows(rows, gran)
+                            if not cleaned:
+                                break
+                            series = cleaned + series
+                            # next page ends before oldest candle
+                            oldest = min(c["t"] for c in cleaned)
+                            if oldest <= start_floor:
+                                break
+                            end = oldest - int(gran)
+                            pages += 1
+                            step += 1
+                            self.history_job = {
+                                "status": "running",
+                                "progress": min(99, int(100 * step / total_steps)),
+                                "message": f"Loading {sym} {gran}s page {pages} ({len(series)} bars)…",
+                                "saved": saved,
+                            }
+                            # Persist page to Supabase
+                            try:
+                                store = _supa()
+                                if store and hasattr(store, "save_candles"):
+                                    store.save_candles(
+                                        symbol=sym,
+                                        granularity=int(gran),
+                                        rows=cleaned,
+                                        account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                                    )
+                                    saved += len(cleaned)
+                            except Exception:
+                                pass
+                            time.sleep(0.15)
+
+                        # dedupe + sort, keep generous history in memory for chart
+                        ordered = normalize_candle_rows(
+                            [c for c in series if c.get("t", 0) >= start_floor], gran
+                        )
+                        self.v75_candles.setdefault(sym, {})[str(int(gran))] = ordered[-8000:]
+                        # Feed shark engine for primary symbol
+                        if sym == SHARK_SYMBOL:
+                            eng = self.ensure_shark()
+                            if eng is not None:
+                                eng.set_candles(int(gran), ordered[-200:])
+                                self.shark_status = eng.status()
+                        step += 1
+                        self.history_job = {
+                            "status": "running",
+                            "progress": min(99, int(100 * step / total_steps)),
+                            "message": f"Done {sym} {gran}s → {len(ordered)} bars",
+                            "saved": saved,
+                        }
+
+                if own_ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                self.history_job = {
+                    "status": "done",
+                    "progress": 100,
+                    "message": f"V75 history loaded (~{years}y). Saved ~{saved} candle rows.",
+                    "saved": saved,
+                }
+                self.note("info", self.history_job["message"])
+            except Exception as e:
+                self.history_job = {
+                    "status": "error",
+                    "progress": 0,
+                    "message": f"History load failed: {e}",
+                    "saved": 0,
+                }
+                self.note("error", str(e))
+
+        threading.Thread(target=worker, name="v75-history", daemon=True).start()
+        return {"ok": True, "message": "V75 history load started (up to ~1 year)"}
+
+    def _supa_sync_strategy_budgets(self) -> None:
+        """Persist per-strategy $budget / P/L to Supabase."""
+        store = _supa()
+        if not store or not getattr(store, "enabled", False):
+            return
+        if not hasattr(store, "upsert_strategy_budget"):
+            return
+        at = ACCOUNT.get("type") or ACCOUNT_TYPE
+        aid = ACCOUNT.get("id")
+        budget = float(getattr(self, "strategy_budget", 100.0) or 100.0)
+        pnl_map = getattr(self, "strategy_pnl", {}) or {}
+        trades_map = getattr(self, "strategy_trades", {}) or {}
+        stopped_map = getattr(self, "strategy_stopped", {}) or {}
+        for name in STRATEGY_MODES:
+            try:
+                store.upsert_strategy_budget(
+                    strategy=name,
+                    account_type=at,
+                    account_id=aid,
+                    budget=budget,
+                    pnl=float(pnl_map.get(name, 0.0) or 0.0),
+                    trades=int(trades_map.get(name, 0) or 0),
+                    stopped=bool(stopped_map.get(name, False)),
+                    session_id=getattr(store, "current_session_id", None),
+                )
+            except Exception as e:
+                print(f"[supabase] strategy_budget {name}: {e}", flush=True)
+
+    def strategy_active(self, name: str) -> bool:
+        if getattr(self, "strategy_stopped", {}).get(name):
+            return False
+        active = getattr(self, "active_strategies", None)
+        if not active:
+            active = [getattr(self, "strategy_mode", "digits")]
+        return name in active
+
+    def strategy_budget_left(self, name: str) -> float:
+        pnl = float((getattr(self, "strategy_pnl", {}) or {}).get(name, 0.0) or 0.0)
+        budget = float(getattr(self, "strategy_budget", 100.0) or 100.0)
+        return max(0.0, budget + min(0.0, pnl))
+
+    def ensure_matches(self):
+        eng = getattr(self, "matches", None)
+        if eng is not None:
+            return eng
+        try:
+            cls = MatchEngine
+        except NameError:
+            cls = None
+        if cls is None:
+            try:
+                from strategy_matches import MatchEngine as cls  # type: ignore
+            except Exception as e:
+                self.note("warn", f"Match engine unavailable: {e}")
+                return None
+        try:
+            self.matches = cls(both=True)
+            return self.matches
+        except Exception as e:
+            self.note("warn", f"Match engine init failed: {e}")
+            self.matches = None
+            return None
+
+    def ensure_nextdigit(self):
+        eng = getattr(self, "nextdigit", None)
+        if eng is not None:
+            return eng
+        try:
+            cls = NextDigitEngine
+        except NameError:
+            cls = None
+        if cls is None:
+            try:
+                from strategy_nextdigit import NextDigitEngine as cls  # type: ignore
+            except Exception as e:
+                self.note("warn", f"NextDigit engine unavailable: {e}")
+                return None
+        try:
+            self.nextdigit = cls()
+            return self.nextdigit
+        except Exception as e:
+            self.note("warn", f"NextDigit init failed: {e}")
+            self.nextdigit = None
+            return None
+
+    def ensure_shark(self):
+        """Return SharkEngine instance or None (never raises NameError)."""
+        eng = getattr(self, "shark", None)
+        if eng is not None:
+            return eng
+        try:
+            cls = SharkEngine
+        except NameError:
+            cls = None
+        if cls is None:
+            try:
+                from strategy_shark import SharkEngine as cls  # type: ignore
+            except Exception as e:
+                self.note("warn", f"Shark engine unavailable: {e}")
+                return None
+        try:
+            self.shark = cls(SHARK_SYMBOL)
+            return self.shark
+        except Exception as e:
+            self.note("warn", f"Shark engine init failed: {e}")
+            self.shark = None
+            return None
 
     # ---------- dashboard helpers ----------
 
@@ -306,6 +742,8 @@ class Bot:
             "manual_symbol": None,
             "manual_strategy": None,
             "manual_skip_filter": False,
+            "trades_window_started": time.time(),
+            "limit_refresh_count": 0,
             "paused": False,
             "reconnect_requested": False,
             "last_connect_attempt": 0.0,
@@ -319,6 +757,21 @@ class Bot:
             "session_count": 0,
             "last_error": None,
             "currency": "USD",
+            "strategy_mode": "digits",
+            "active_strategies": None,
+            "strategy_budget": 100.0,
+            "strategy_pnl": None,
+            "strategy_trades": None,
+            "strategy_stopped": None,
+            "matches": None,
+            "matches_status": {},
+            "nextdigit": None,
+            "nextdigit_status": {},
+            "shark": None,
+            "shark_status": {},
+            "_pending_shark_signal": None,
+            "price_history": None,
+            "limit_hit_at": None,
         }
         for k, v in defaults.items():
             if not hasattr(self, k):
@@ -349,6 +802,11 @@ class Bot:
                           f"Auto-restart in {RESTART_DELAY_SECS}s "
                           f"(new session after {reason.replace('_', '-')}).")
 
+        try:
+            self._supa_end_session(reason)
+        except Exception:
+            pass
+
     def set_paused(self, paused: bool):
         with self.lock:
             if self.stop:
@@ -375,6 +833,58 @@ class Bot:
                       + (f" ({', '.join(parts)})" if parts else "."))
             return True
 
+
+    def refresh_trade_limit(self, reason: str = "manual") -> dict:
+        """Reset the session trade counter (MAX_TRADES window) without wiping history."""
+        with self.lock:
+            prev = self.trades
+            self.trades = 0
+            self.trades_window_started = time.time()
+            self.limit_hit_at = None
+            self.limit_refresh_count = getattr(self, "limit_refresh_count", 0) + 1
+            self._limit_warned = False
+            cleared_stop = False
+            if self.stop and self.stop_reason == "max_trades":
+                self.stop = False
+                self.stop_reason = None
+                self.restart_at = None
+                cleared_stop = True
+            self.note(
+                "info",
+                f"Trade limit refreshed ({reason}): {prev}/{MAX_TRADES} → 0/{MAX_TRADES}"
+                + (" · trading resumed" if cleared_stop else ""),
+            )
+            return {
+                "ok": True,
+                "message": f"Trade limit reset (was {prev}/{MAX_TRADES})",
+                "previous": prev,
+                "max_trades": MAX_TRADES,
+                "resumed": cleared_stop,
+            }
+
+    def maybe_auto_refresh_trade_limit(self) -> None:
+        """Auto-reset only after the trade limit is reached, then wait REFRESH_SECS."""
+        if self.trades < MAX_TRADES:
+            # Not at limit – clear any previous "hit" timer
+            if getattr(self, "limit_hit_at", None):
+                with self.lock:
+                    self.limit_hit_at = None
+            return
+        # At limit: start timer on first hit
+        hit = getattr(self, "limit_hit_at", None)
+        if not hit:
+            with self.lock:
+                self.limit_hit_at = time.time()
+            self.note(
+                "warn",
+                f"Trade limit {MAX_TRADES} reached – auto-refresh in {TRADE_LIMIT_REFRESH_SECS // 60} min "
+                f"(or tap Refresh limit)",
+            )
+            return
+        if time.time() - hit < TRADE_LIMIT_REFRESH_SECS:
+            return
+        self.refresh_trade_limit(reason="auto-after-limit")
+
     def control(self, action: str, **kwargs) -> dict:
         """Dashboard control actions. Returns {ok, message}."""
         self.ensure_attrs()
@@ -399,10 +909,13 @@ class Bot:
         if action == "stop":
             self.request_stop("user", "Stopped from dashboard.")
             return {"ok": True, "message": "Stopped"}
+        if action in ("refresh_limit", "reset_trades", "refresh_trades"):
+            return self.refresh_trade_limit(reason="dashboard")
         if action == "reset_stats":
             with self.lock:
                 self.trade_log.clear()
                 self.trades = 0
+                self.trades_window_started = time.time()
                 if self.balance is not None:
                     self.start_balance = self.balance
                 self.note("info", "Stats reset from dashboard.")
@@ -437,7 +950,174 @@ class Bot:
         if action == "reset_session":
             self.reset_session()
             return {"ok": True, "message": "Session reset"}
+        if action in ("start", "start_strategy", "start_bot"):
+            # Start / arm active strategy: clear stop, unpause, ensure engine
+            mode = getattr(self, "strategy_mode", DEFAULT_STRATEGY_MODE) or DEFAULT_STRATEGY_MODE
+            with self.lock:
+                self.stop = False
+                self.stop_reason = None
+                self.restart_at = None
+                self.paused = False
+                if mode == "shark":
+                    self.ensure_shark()
+            self.reconnect_requested = True
+            self.note("info", f"Strategy started ({mode})")
+            return {"ok": True, "message": f"Started {mode} strategy"}
+        if action in ("fetch_v75_history", "load_history", "load_v75", "backfill_candles"):
+            years = kwargs.get("years", 1)
+            try:
+                years = float(years)
+            except (TypeError, ValueError):
+                years = 1.0
+            years = max(0.1, min(years, 2.0))
+            return self.fetch_v75_history(years=years)
+        if action in ("set_chart_symbol", "chart_symbol"):
+            sym = (kwargs.get("symbol") or kwargs.get("mode") or "").strip()
+            v75 = list(globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"]))
+            if sym not in v75 and sym not in CANDIDATE_SYMBOLS:
+                return {"ok": False, "message": f"Unknown symbol {sym}"}
+            with self.lock:
+                self.chart_symbol = sym
+            if sym in v75:
+                # keep trading symbol as SHARK_SYMBOL; chart can differ
+                pass
+            self.note("info", f"Chart symbol → {sym}")
+            return {"ok": True, "message": f"Chart: {sym}"}
+        if action in ("set_active_strategies", "active_strategies", "set_strategies"):
+            raw = kwargs.get("strategies") or kwargs.get("modes") or kwargs.get("mode") or ""
+            if isinstance(raw, str):
+                if raw.strip().lower() in ("all", "*"):
+                    chosen = list(STRATEGY_MODES)
+                else:
+                    chosen = [s.strip().lower() for s in raw.split(",") if s.strip().lower() in STRATEGY_MODES]
+            elif isinstance(raw, (list, tuple)):
+                chosen = [str(s).strip().lower() for s in raw if str(s).strip().lower() in STRATEGY_MODES]
+            else:
+                chosen = []
+            if not chosen:
+                return {"ok": False, "message": "Use digits,shark,matches,nextdigit or all"}
+            with self.lock:
+                self.active_strategies = chosen
+                self.strategy_mode = chosen[0]
+                # Clear stop flags for selected strategies; leave others as-is
+                for m in STRATEGY_MODES:
+                    if m in chosen:
+                        self.strategy_stopped[m] = False
+                if "shark" in chosen:
+                    self.ensure_shark()
+                if "matches" in chosen:
+                    eng = self.ensure_matches()
+                    if eng is None:
+                        return {"ok": False, "message": "Matches engine unavailable – deploy strategy_matches.py"}
+                if "nextdigit" in chosen:
+                    eng = self.ensure_nextdigit()
+                    if eng is None:
+                        return {"ok": False, "message": "NextDigit engine unavailable – deploy strategy_nextdigit.py"}
+            try:
+                self._supa_sync_strategy_budgets()
+            except Exception:
+                pass
+            self.note("info", "Active strategies → " + ",".join(chosen))
+            return {"ok": True, "message": "Active: " + ",".join(chosen)}
+        if action in ("set_mode", "strategy_mode", "set_strategy"):
+            mode = (
+                kwargs.get("mode")
+                or kwargs.get("strategy_mode")
+                or kwargs.get("strategy")
+                or ""
+            )
+            mode = str(mode).strip().lower()
+            # Digit sub-preference (not a full mode switch)
+            if mode in ("over", "under"):
+                self.force_next(strategy=mode)
+                return {"ok": True, "message": f"Digit preference: {mode}"}
+            if mode not in STRATEGY_MODES:
+                return {"ok": False, "message": "mode must be digits, shark, matches, or nextdigit"}
+            with self.lock:
+                self.strategy_mode = mode
+                if mode not in getattr(self, "active_strategies", []):
+                    cur = list(getattr(self, "active_strategies", []) or [])
+                    cur.append(mode)
+                    self.active_strategies = list(dict.fromkeys(cur))
+                self.strategy_stopped[mode] = False
+                if mode == "shark" and self.ensure_shark() is None:
+                    return {"ok": False, "message": "Shark engine unavailable"}
+                if mode == "matches" and self.ensure_matches() is None:
+                    return {"ok": False, "message": "Matches engine unavailable"}
+                if mode == "nextdigit" and self.ensure_nextdigit() is None:
+                    return {"ok": False, "message": "NextDigit engine unavailable"}
+            self.note("info", f"Strategy focus → {mode} | active={','.join(self.active_strategies)}")
+            return {"ok": True, "message": f"Focus {mode}; active: {','.join(self.active_strategies)}"}
         return {"ok": False, "message": f"Unknown action: {action}"}
+
+
+    def _session_stats(self):
+        closed = [r for r in self.trade_log if r.get("status") in ("won", "lost")]
+        wins = sum(1 for r in closed if r["status"] == "won")
+        losses = len(closed) - wins
+        pl = None
+        if self.balance is not None and self.start_balance is not None:
+            pl = round(self.balance - self.start_balance, 2)
+        return {
+            "trades_count": len(closed),
+            "wins": wins,
+            "losses": losses,
+            "session_pl": pl,
+            "end_balance": self.balance,
+        }
+
+    def _supa_start_session(self):
+        store = _supa()
+        if not store:
+            return
+        try:
+            store.start_session(
+                account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                account_id=ACCOUNT.get("id"),
+                session_no=getattr(self, "session_count", 1) or 1,
+                start_balance=self.start_balance if self.start_balance is not None else self.balance,
+                currency=self.currency or "USD",
+                strategy_mode=getattr(self, "strategy_mode", "digits"),
+            )
+            try:
+                self._supa_sync_strategy_budgets()
+            except Exception:
+                pass
+        except Exception as e:
+            self.note("warn", f"Supabase session start failed: {e}")
+
+    def _supa_end_session(self, reason=None):
+        store = _supa()
+        if not store:
+            return
+        try:
+            st = self._session_stats()
+            store.end_session(
+                end_balance=st["end_balance"],
+                session_pl=st["session_pl"],
+                trades_count=st["trades_count"],
+                wins=st["wins"],
+                losses=st["losses"],
+                stop_reason=reason or self.stop_reason,
+            )
+        except Exception as e:
+            self.note("warn", f"Supabase session end failed: {e}")
+
+    def _supa_update_session(self):
+        store = _supa()
+        if not store:
+            return
+        try:
+            st = self._session_stats()
+            store.update_session_pl(
+                end_balance=st["end_balance"],
+                session_pl=st["session_pl"],
+                trades_count=st["trades_count"],
+                wins=st["wins"],
+                losses=st["losses"],
+            )
+        except Exception as e:
+            print(f"[supabase] update session: {e}", flush=True)
 
     def reset_session(self):
         """Clear session P/L, barrier ladders and counters so a new run can start.
@@ -461,6 +1141,10 @@ class Bot:
                               f"(P/L counters and barrier ladders reset).")
             print(f"\n=== Session #{self.session_count} started "
                   f"(balance baseline {self.balance}) ===\n")
+            try:
+                self._supa_start_session()
+            except Exception:
+                pass
 
     def snapshot(self, running: bool, protected: bool) -> dict:
         """Everything the dashboard shows, as plain JSON-safe data."""
@@ -533,13 +1217,46 @@ class Bot:
                 "last_error": self.last_error,
                 "protected": protected,
                 "trading_enabled": TRADING_ENABLED,
+                "supabase": {
+                    "enabled": bool(_supa() and getattr(_supa(), "enabled", False)),
+                    "session_id": getattr(_supa(), "current_session_id", None) if _supa() else None,
+                    "last_error": getattr(_supa(), "last_error", None) if _supa() else None,
+                },
+                "strategy_mode": getattr(self, "strategy_mode", DEFAULT_STRATEGY_MODE),
+                "history_job": getattr(self, "history_job", None),
+                "shark": (getattr(self, "shark").status() if getattr(self, "shark", None) else {"reason": "unavailable"}),
+                "chart": {
+                    "symbol": getattr(self, "chart_symbol", None) or SHARK_SYMBOL,
+                    "v75_symbols": list(globals().get("V75_SYMBOLS", ["R_75", "1HZ75V"])),
+                    "points": list((getattr(self, "price_history", None) or {}).get(SHARK_SYMBOL, []))[-180:]
+                    if getattr(self, "price_history", None) is not None
+                    else [],
+                    "candles": (getattr(self, "shark").status().get("candles") if getattr(self, "shark", None) else {}),
+                    "v75_candles": getattr(self, "v75_candles", {}) or {},
+                    "targets": (getattr(self, "shark").status().get("targets") if getattr(self, "shark", None) else {}),
+                    "levels": (getattr(self, "shark").status().get("levels") if getattr(self, "shark", None) else {}),
+                    "default_tf": "300",
+                    "strategy_tfs": ["300", "900", "3600"],
+                },
                 "account": dict(ACCOUNT),
                 "currency": self.currency,
                 "balance": self.balance,
                 "session_pl": session_pl,
                 "balance_history": list(self.balance_history)[-120:],
-                "limits": {"max_trades": MAX_TRADES, "stop_loss": STOP_LOSS,
-                           "take_profit": TAKE_PROFIT, "stake": STAKE},
+                "limits": {
+                    "max_trades": MAX_TRADES,
+                    "stop_loss": STOP_LOSS,
+                    "take_profit": TAKE_PROFIT,
+                    "stake": STAKE,
+                    "refresh_secs": TRADE_LIMIT_REFRESH_SECS,
+                    "refresh_in": (
+                        max(0, int(TRADE_LIMIT_REFRESH_SECS - (time.time() - self.limit_hit_at)))
+                        if getattr(self, "limit_hit_at", None) and self.trades >= MAX_TRADES
+                        else None
+                    ),
+                    "limit_reached": self.trades >= MAX_TRADES,
+                    "limit_refresh_count": getattr(self, "limit_refresh_count", 0),
+                },
                 "stats": {"trades": self.trades, "wins": wins, "losses": losses,
                           "win_rate": (wins / len(closed)) if closed else None,
                           "net": round(net, 2)},
@@ -617,35 +1334,231 @@ class Bot:
         return best
 
     def can_trade(self, symbol: str) -> str | None:
-        """Return the strategy to trade on this market now, or None."""
-        self.ensure_attrs()
-        if self.stop or self.paused or self.pending or self.open_contract:
+        """Return strategy key if a trade is allowed for this symbol, else None."""
+        if self.stop or self.paused or not TRADING_ENABLED:
             return None
-        if self.manual_symbol and symbol != self.manual_symbol:
-            return None
-        if time.time() - self.last_trade_ts < COOLDOWN_SECONDS:
+        if self.pending or self.open_contract:
             return None
         if self.trades >= MAX_TRADES:
-            self.request_stop("max_trades",
-                              f"Trade limit of {MAX_TRADES} reached – stopping.")
+            self._maybe_refresh_trade_limit()
+            if self.trades >= MAX_TRADES:
+                return None
+        now = time.time()
+        if now - getattr(self, "last_trade_ts", 0) < COOLDOWN_SECONDS:
             return None
-        if self.manual_strategy:
-            key = self.manual_strategy
-            if getattr(self, 'manual_skip_filter', False) or self.is_eligible(symbol, key):
-                return key
-            return None
-        if self.manual_symbol:
-            key = self.pick_strategy(symbol)
-            if key:
-                return key
-            if getattr(self, 'manual_skip_filter', False):
+
+        if getattr(self, "manual_strategy", None) or getattr(self, "manual_symbol", None):
+            if self.manual_symbol and symbol != self.manual_symbol:
+                return None
+            return self.manual_strategy or "digits"
+
+        if bot_strategy_active(self, "shark") and symbol == SHARK_SYMBOL:
+            if bot_strategy_budget_left(self, "shark") >= STAKE:
+                sig = getattr(self, "_pending_shark_signal", None)
+                if sig and getattr(sig, "symbol", None) == symbol:
+                    return "shark"
+
+        if bot_strategy_active(self, "matches") and bot_strategy_budget_left(self, "matches") >= STAKE:
+            try:
+                from strategy_matches import MATCH_SYMBOLS as _MS
+            except Exception:
+                _MS = ("1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+                       "R_10", "R_25", "R_50", "R_75", "R_100")
+            # Allow any subscribed volatility symbol for matches
+            if symbol in _MS or symbol in CANDIDATE_SYMBOLS:
+                for s in (getattr(self, "_pending_match_signals", None) or []):
+                    if getattr(s, "symbol", None) == symbol:
+                        return "matches"
+                # If pending exists for another symbol, still allow this symbol's pending only
+
+        if bot_strategy_active(self, "nextdigit") and bot_strategy_budget_left(self, "nextdigit") >= STAKE:
+            try:
+                from strategy_nextdigit import NEXT_DIGIT_SYMBOLS as _NDS
+            except Exception:
+                _NDS = ("1HZ10V", "1HZ100V", "R_10", "R_100")
+            if symbol in _NDS:
+                sig = getattr(self, "_pending_nextdigit_signal", None)
+                if sig and getattr(sig, "symbol", None) == symbol:
+                    return "nextdigit"
+
+        if bot_strategy_active(self, "digits") and bot_strategy_budget_left(self, "digits") >= STAKE:
+            if self.is_eligible(symbol, "over"):
                 return "over"
-            return None
-        return self.pick_strategy(symbol)
+            if self.is_eligible(symbol, "under"):
+                return "under"
+        return None
+
+
+    def _manage_shark_exits(self, ws, price: float) -> None:
+        """Sell Shark legs when price hits TP1 (50%), TP2 (rest), or SL."""
+        legs = getattr(self, "open_shark_legs", None) or []
+        if not legs:
+            return
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            return
+        remain = []
+        for leg in legs:
+            if leg.get("sold"):
+                continue
+            side = leg.get("side")  # buy | sell
+            tp = leg.get("tp_price")
+            sl = leg.get("sl")
+            hit = False
+            reason = ""
+            if side == "buy":
+                if tp is not None and px >= float(tp):
+                    hit, reason = True, f"TP {leg.get('leg')}"
+                elif sl is not None and px <= float(sl):
+                    hit, reason = True, "SL"
+            elif side == "sell":
+                if tp is not None and px <= float(tp):
+                    hit, reason = True, f"TP {leg.get('leg')}"
+                elif sl is not None and px >= float(sl):
+                    hit, reason = True, "SL"
+            if hit and leg.get("contract_id"):
+                try:
+                    ws.send(json.dumps({
+                        "sell": leg["contract_id"],
+                        "price": 0,  # market sell at indicative
+                    }))
+                    leg["sold"] = True
+                    self.note("info", f"Shark exit {reason}: sold {leg['contract_id']} @ {px:.2f}")
+                except Exception as e:
+                    print(f"[shark] sell failed: {e}", flush=True)
+                    remain.append(leg)
+            else:
+                remain.append(leg)
+        self.open_shark_legs = remain
 
     def try_trade(self, ws, symbol: str, price: float):
         key = self.can_trade(symbol)
         if key is None:
+            return
+
+        # ---- Shark mode: Rise/Fall (CALL/PUT) ----
+        if key == "shark":
+            sig = getattr(self, "_pending_shark_signal", None)
+            if not sig:
+                return
+            ctype = "CALL" if sig.side == "buy" else "PUT"
+            print(f"\n★ SHARK {symbol} {sig.side.upper()} @ {price:.5f} – {sig.reason}")
+            if not TRADING_ENABLED:
+                print("  [signals only] TRADING_ENABLED=False")
+                self._pending_shark_signal = None
+                return
+            self.pending = True
+            self.pending_since = time.time()
+            self.pending_trade = {
+                "symbol": symbol,
+                "contract_type": ctype,
+                "barrier": None,
+                "strategy": "shark",
+                "side": sig.side,
+                "setup_meta": sig.meta,
+                "strategy_mode": "shark",
+            }
+            self._pending_shark_signal = None
+            ws.send(json.dumps({
+                "buy": 1,
+                "price": STAKE,
+                "parameters": {
+                    "amount": STAKE,
+                    "basis": "stake",
+                    "contract_type": ctype,
+                    "currency": self.currency,
+                    "duration": SHARK_DURATION_TICKS,
+                    "duration_unit": "t",
+                    "underlying_symbol": symbol,
+                },
+            }))
+            return
+
+        # ---- Digit Matches / Difference ----
+        if key == "matches":
+            pending = getattr(self, "_pending_match_signals", None) or []
+            sig = None
+            for s in pending:
+                if getattr(s, "symbol", None) == symbol:
+                    sig = s
+                    break
+            if not sig:
+                return
+            # consume this signal
+            self._pending_match_signals = [s for s in pending if s is not sig]
+            ctype = sig.contract_type
+            barrier = str(sig.digit)
+            print(f"\n★ MATCHES {symbol} {ctype} digit={barrier} – {sig.reason}")
+            if not TRADING_ENABLED:
+                print("  [signals only] TRADING_ENABLED=False")
+                return
+            self.pending = True
+            self.pending_since = time.time()
+            self.pending_trade = {
+                "symbol": symbol,
+                "contract_type": ctype,
+                "barrier": int(sig.digit),
+                "strategy": "matches",
+                "side": sig.side,
+                "setup_meta": sig.meta,
+                "strategy_mode": "matches",
+            }
+            self.manual_symbol = None
+            self.manual_strategy = None
+            self.manual_skip_filter = False
+            params = {
+                "amount": STAKE,
+                "basis": "stake",
+                "contract_type": ctype,
+                "currency": self.currency or "USD",
+                "duration": 1,
+                "duration_unit": "t",
+                "symbol": symbol,
+                "underlying_symbol": symbol,
+                "barrier": str(barrier),
+            }
+            ws.send(json.dumps({"buy": 1, "price": STAKE, "parameters": params}))
+            return
+
+        # ---- Next digit prediction (DIGITMATCH) ----
+        if key == "nextdigit":
+            sig = getattr(self, "_pending_nextdigit_signal", None)
+            if not sig or getattr(sig, "symbol", None) != symbol:
+                return
+            self._pending_nextdigit_signal = None
+            barrier = str(sig.digit)
+            ctype = "DIGITMATCH"
+            print(f"\n★ NEXTDIGIT {symbol} predict={barrier} conf={sig.confidence:.1%} – {sig.reason}")
+            if not TRADING_ENABLED:
+                print("  [signals only] TRADING_ENABLED=False")
+                return
+            self.pending = True
+            self.pending_since = time.time()
+            self.pending_trade = {
+                "symbol": symbol,
+                "contract_type": ctype,
+                "barrier": int(sig.digit),
+                "strategy": "nextdigit",
+                "side": "match",
+                "setup_meta": sig.meta,
+                "strategy_mode": "nextdigit",
+            }
+            self.manual_symbol = None
+            self.manual_strategy = None
+            self.manual_skip_filter = False
+            params = {
+                "amount": STAKE,
+                "basis": "stake",
+                "contract_type": ctype,
+                "currency": self.currency or "USD",
+                "duration": 1,
+                "duration_unit": "t",
+                "symbol": symbol,
+                "underlying_symbol": symbol,
+                "barrier": str(barrier),
+            }
+            ws.send(json.dumps({"buy": 1, "price": STAKE, "parameters": params}))
             return
 
         s       = STRATEGIES[key]
@@ -664,7 +1577,8 @@ class Bot:
         self.pending = True
         self.pending_since = time.time()
         self.pending_trade = {"symbol": symbol, "contract_type": ctype,
-                              "barrier": int(barrier), "strategy": key}
+                              "barrier": int(barrier), "strategy": key,
+                              "strategy_mode": "digits"}
         self.manual_symbol = None
         self.manual_strategy = None
         self.manual_skip_filter = False
@@ -721,7 +1635,117 @@ class Bot:
 
         t = msg.get("msg_type")
 
-        # ---- tick ----
+        # ---- multi-TF candles / OHLC stream (Shark) ----
+        if t in ("candles", "ohlc", "history") or (t is None and ("candles" in msg or "ohlc" in msg)):
+            try:
+                echo = msg.get("echo_req") if isinstance(msg.get("echo_req"), dict) else {}
+                rows = msg.get("candles") or []
+                gran = echo.get("granularity")
+                sym = (
+                    echo.get("ticks_history")
+                    or echo.get("symbol")
+                    or (msg.get("ohlc") or {}).get("symbol")
+                    or SHARK_SYMBOL
+                )
+                # Store candles for every V75 symbol (chart switcher)
+                if rows and gran:
+                    if not hasattr(self, "v75_candles") or self.v75_candles is None:
+                        self.v75_candles = {}
+                    bucket = self.v75_candles.setdefault(sym, {})
+                    cleaned = normalize_candle_rows(rows, int(gran))
+                    # Merge with existing history (don't wipe 1y data with 150-bar snapshot)
+                    prev = bucket.get(str(int(gran)), [])
+                    merged = normalize_candle_rows(list(prev) + cleaned, int(gran))
+                    bucket[str(int(gran))] = merged[-8000:]
+                    # Feed primary shark engine only for active SHARK_SYMBOL
+                    if sym == SHARK_SYMBOL:
+                        eng = self.ensure_shark()
+                        if eng is not None:
+                            eng.set_candles(int(gran), rows)
+                            try:
+                                eng.evaluate()
+                            except Exception:
+                                pass
+                            self.shark_status = eng.status()
+                    try:
+                        store = _supa()
+                        if store and hasattr(store, "save_candles"):
+                            store.save_candles(
+                                symbol=sym,
+                                granularity=int(gran),
+                                rows=rows[-20:],
+                                account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                            )
+                    except Exception:
+                        pass
+                    return
+                # Streaming OHLC update
+                ohlc = msg.get("ohlc") or {}
+                if ohlc:
+                    gran = ohlc.get("granularity") or gran
+                    sym = ohlc.get("symbol") or sym or SHARK_SYMBOL
+                    if gran:
+                        # update v75 store
+                        if not hasattr(self, "v75_candles") or self.v75_candles is None:
+                            self.v75_candles = {}
+                        bucket = self.v75_candles.setdefault(sym, {})
+                        gkey = str(int(gran))
+                        series = bucket.setdefault(gkey, [])
+                        try:
+                            t = int(ohlc.get("epoch") or ohlc.get("open_time") or ohlc.get("t") or 0)
+                            if t > 10_000_000_000:
+                                t = t // 1000
+                            g = int(gran)
+                            t = (t // g) * g
+                            row = {
+                                "t": t,
+                                "o": float(ohlc.get("open", ohlc.get("o"))),
+                                "h": float(ohlc.get("high", ohlc.get("h"))),
+                                "l": float(ohlc.get("low", ohlc.get("l"))),
+                                "c": float(ohlc.get("close", ohlc.get("c"))),
+                            }
+                            row["h"] = max(row["h"], row["o"], row["c"])
+                            row["l"] = min(row["l"], row["o"], row["c"])
+                            if series and series[-1]["t"] == row["t"]:
+                                # update forming candle
+                                prev = series[-1]
+                                series[-1] = {
+                                    "t": row["t"],
+                                    "o": prev["o"],
+                                    "h": max(prev["h"], row["h"]),
+                                    "l": min(prev["l"], row["l"]),
+                                    "c": row["c"],
+                                }
+                            elif not series or row["t"] > series[-1]["t"]:
+                                series.append(row)
+                                bucket[gkey] = series[-8000:]
+                        except (TypeError, ValueError, KeyError):
+                            pass
+                        if sym == SHARK_SYMBOL:
+                            eng = self.ensure_shark()
+                            if eng is not None:
+                                sig = eng.upsert_ohlc(int(gran), ohlc)
+                                self.shark_status = eng.status()
+                                if sig and getattr(self, "strategy_mode", "digits") == "shark":
+                                    self._pending_shark_signal = sig
+                                    self.note("info", f"Shark signal: {sig.side} – {sig.reason}")
+                                    try:
+                                        store = _supa()
+                                        if store and hasattr(store, "save_shark_signal"):
+                                            store.save_shark_signal(
+                                                sig,
+                                                account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                                                account_id=ACCOUNT.get("id"),
+                                            )
+                                    except Exception:
+                                        pass
+                                    price = float(ohlc.get("close") or ohlc.get("c") or 0)
+                                    if price:
+                                        self.try_trade(ws, SHARK_SYMBOL, price)
+            except Exception as e:
+                print(f"[shark] candle handle: {e}", flush=True)
+            return
+
         if t == "tick" or "tick" in msg:
             tick = msg.get("tick") or msg
             symbol = (tick.get("symbol") or
@@ -734,6 +1758,32 @@ class Bot:
 
             digit = self.tick_digit(symbol, tick, price)
             self.digit_history[symbol].append(digit)
+            try:
+                ph = self.price_history[symbol]
+                ph.append([round(time.time(), 2), float(price)])
+            except Exception:
+                pass
+            # Always update digit engines so Strategy UI can show heat/predictions
+            meng = self.ensure_matches()
+            if meng is not None:
+                try:
+                    sigs = meng.on_digit(symbol, digit)
+                    self.matches_status = meng.status()
+                    if sigs and bot_strategy_active(self, "matches"):
+                        self._pending_match_signals = list(sigs)
+                        self.note("info", f"Matches: {sigs[0].reason}")
+                except Exception as e:
+                    print(f"[matches] on_digit: {e}", flush=True)
+            neng = self.ensure_nextdigit()
+            if neng is not None:
+                try:
+                    nsig = neng.on_digit(symbol, digit)
+                    self.nextdigit_status = neng.status()
+                    if nsig and bot_strategy_active(self, "nextdigit"):
+                        self._pending_nextdigit_signal = nsig
+                        self.note("info", f"NextDigit: {nsig.reason}")
+                except Exception as e:
+                    print(f"[nextdigit] on_digit: {e}", flush=True)
             self.last_price[symbol] = price
             self.ticks_seen += 1
 
@@ -757,7 +1807,34 @@ class Bot:
                       f"Under {self.current_barrier('under')})")
                 self.last_status[symbol] = status_key
 
-            self.try_trade(ws, symbol, price)
+
+            # Managed Shark exits: sell leg at TP1 / TP2 / SL
+            if getattr(self, "open_shark_legs", None) and symbol == SHARK_SYMBOL:
+                self._manage_shark_exits(ws, price)
+
+            # Shark mode: evaluate structure/OB/0.886 on configured symbol
+            shark_eng = getattr(self, "shark", None)
+            if bot_strategy_active(self, "shark") and symbol == SHARK_SYMBOL:
+                if shark_eng is None:
+                    shark_eng = self.ensure_shark()
+                if shark_eng is not None:
+                    sig = shark_eng.on_tick(price)
+                    self.shark_status = shark_eng.status()
+                else:
+                    sig = None
+                if sig:
+                    self._pending_shark_signal = sig
+                    self.note("info", f"Shark signal: {sig.side} {symbol} – {sig.reason}")
+                    try:
+                        store = _supa()
+                        if store and hasattr(store, "save_shark_signal"):
+                            store.save_shark_signal(sig, account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                                                   account_id=ACCOUNT.get("id"))
+                    except Exception:
+                        pass
+            if (bot_strategy_active(self, "digits") or bot_strategy_active(self, "shark")
+                    or bot_strategy_active(self, "matches") or bot_strategy_active(self, "nextdigit")):
+                self.try_trade(ws, symbol, price)
 
         # ---- balance ----
         elif t == "balance" or "balance" in msg:
@@ -775,6 +1852,13 @@ class Bot:
             if self.start_balance is None:
                 self.start_balance = self.balance
                 print(f"Starting balance: {self.balance:.2f} {self.currency}")
+                if self.session_count == 0:
+                    self.session_count = 1
+                try:
+                    if _supa() and not getattr(_supa(), "current_session_id", None):
+                        self._supa_start_session()
+                except Exception as e:
+                    print(f"[supabase] first session: {e}", flush=True)
 
             profit = self.balance - self.start_balance
             print(f"BALANCE: {self.balance:.2f} {self.currency}  (P/L {profit:+.2f})")
@@ -806,6 +1890,15 @@ class Bot:
         elif t == "buy":
             buy = msg.get("buy") or {}
             contract_id = buy.get("contract_id")
+            # Buy error (no contract)
+            if not contract_id and msg.get("error"):
+                err = (msg.get("error") or {}).get("message") or str(msg.get("error"))
+                self.pending = False
+                self.pending_trade = None
+                self.last_error = f"Buy failed: {err}"
+                self.note("error", self.last_error[:220])
+                self._shark_buy_queue = []
+                return
             self.trades += 1
             self.pending = False
             self.last_trade_ts = time.time()
@@ -816,30 +1909,111 @@ class Bot:
             self.pending_trade = None
             strategy = pt.get("strategy") or "over"
             self.open_strategy = strategy
-            print(f"Trade #{self.trades} placed  ({STRATEGIES[strategy]['label']})  "
+            label = (
+                STRATEGIES[strategy]["label"] if strategy in STRATEGIES
+                else (pt.get("strategy_mode") or strategy or "trade")
+            )
+            print(f"Trade #{self.trades} placed  ({label})  "
                   f"contract_id={contract_id}  barrier={pt.get('barrier')}")
             try:
-                stake = float(buy.get("buy_price") or STAKE)
+                stake = float(buy.get("buy_price") or pt.get("stake") or STAKE)
             except (TypeError, ValueError):
-                stake = STAKE
+                stake = float(pt.get("stake") or STAKE)
+            ctype = pt.get("contract_type")
+            if not ctype and strategy in STRATEGIES:
+                ctype = STRATEGIES[strategy]["contract"]
+            barrier = pt.get("barrier")
+            if barrier is None and strategy in STRATEGIES:
+                try:
+                    barrier = self.current_barrier(strategy)
+                except Exception:
+                    barrier = None
             rec = {
                 "n": self.trades, "contract_id": contract_id,
                 "symbol": pt.get("symbol", "?"),
-                "contract_type": pt.get("contract_type", STRATEGIES[strategy]["contract"]),
-                "barrier": pt.get("barrier", self.current_barrier(strategy)),
+                "contract_type": ctype,
+                "barrier": barrier,
                 "strategy": strategy,
+                "strategy_mode": pt.get("strategy_mode") or getattr(self, "strategy_mode", "digits"),
+                "side": pt.get("side"),
+                "setup_meta": pt.get("setup_meta") or {},
+                "shark_leg": pt.get("shark_leg"),
                 "stake": stake, "status": "open", "profit": None,
                 "t_open": time.time(), "t_close": None,
             }
             self.trade_log.append(rec)
-            kind = "Over" if rec["contract_type"] == "DIGITOVER" else "Under"
-            self.note("info", f"Trade #{rec['n']} placed: {rec['symbol']} {kind} {rec['barrier']}")
+            # Track Shark legs for TP1/TP2 scale-out
+            if (pt.get("strategy_mode") == "shark" or strategy == "shark") and contract_id:
+                if not hasattr(self, "open_shark_legs") or self.open_shark_legs is None:
+                    self.open_shark_legs = []
+                meta = pt.get("setup_meta") or {}
+                self.open_shark_legs.append({
+                    "contract_id": contract_id,
+                    "leg": pt.get("shark_leg") or "full",
+                    "side": pt.get("side"),
+                    "symbol": pt.get("symbol") or SHARK_SYMBOL,
+                    "entry": meta.get("entry"),
+                    "tp1": meta.get("tp1"),
+                    "tp2": meta.get("tp2") if (pt.get("shark_leg") == "tp2") else meta.get("tp1"),
+                    "tp_price": pt.get("tp_price") or (
+                        meta.get("tp2") if pt.get("shark_leg") == "tp2" else meta.get("tp1")
+                    ),
+                    "sl": meta.get("sl"),
+                    "sold": False,
+                })
+            kind = rec.get("contract_type") or "?"
+            self.note("info", f"Trade #{rec['n']} placed: {rec['symbol']} {kind} leg={pt.get('shark_leg') or '-'}")
+            try:
+                store = _supa()
+                if store:
+                    store.save_trade_open(
+                        rec,
+                        account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                        account_id=ACCOUNT.get("id"),
+                        currency=self.currency or "USD",
+                    )
+                    self._supa_update_session()
+            except Exception as e:
+                print(f"[supabase] save open trade: {e}", flush=True)
 
             if contract_id:
                 ws.send(json.dumps({
                     "proposal_open_contract": 1,
                     "contract_id": contract_id,
                     "subscribe": 1,
+                }))
+            # Place second Shark leg (TP2 half) if queued
+            q = getattr(self, "_shark_buy_queue", None) or []
+            if q:
+                nxt = q.pop(0)
+                self._shark_buy_queue = q
+                self.pending = True
+                self.pending_since = time.time()
+                self.pending_trade = {
+                    "symbol": nxt["symbol"],
+                    "contract_type": nxt["contract_type"],
+                    "barrier": None,
+                    "strategy": "shark",
+                    "side": nxt.get("side"),
+                    "setup_meta": nxt.get("setup_meta") or {},
+                    "strategy_mode": "shark",
+                    "shark_leg": nxt.get("shark_leg") or "tp2",
+                    "stake": nxt.get("stake") or (STAKE * 0.5),
+                    "tp_price": nxt.get("tp_price"),
+                }
+                ws.send(json.dumps({
+                    "buy": 1,
+                    "price": nxt.get("stake") or (STAKE * 0.5),
+                    "parameters": {
+                        "amount": nxt.get("stake") or (STAKE * 0.5),
+                        "basis": "stake",
+                        "contract_type": nxt["contract_type"],
+                        "currency": self.currency or "USD",
+                        "duration": nxt.get("duration") or SHARK_DURATION_MINUTES,
+                        "duration_unit": nxt.get("duration_unit") or "m",
+                        "symbol": nxt["symbol"],
+                        "underlying_symbol": nxt["symbol"],
+                    },
                 }))
 
         # ---- contract result ----
@@ -864,15 +2038,45 @@ class Bot:
                 rec["profit"]  = profit
                 rec["t_close"] = time.time()
                 self.note("info", f"Trade #{rec['n']} {rec['status']}: {profit:+.2f}")
+                try:
+                    if _supa():
+                        _supa().save_trade_close(
+                            rec,
+                            account_type=ACCOUNT.get("type") or ACCOUNT_TYPE,
+                        )
+                        self._supa_update_session()
+                except Exception as e:
+                    print(f"[supabase] save close trade: {e}", flush=True)
 
-            # Only the strategy that placed this trade moves its own barrier ladder.
+            # Attribute P/L to strategy budget; only digit strategies move barrier ladders.
             key = (rec or {}).get("strategy") or self.open_strategy
+            mode = (rec.get("strategy_mode") if rec else None) or key or "digits"
+            if mode in ("over", "under"):
+                mode = "digits"
+            if mode not in self.strategy_pnl:
+                self.strategy_pnl[mode] = 0.0
+            self.strategy_pnl[mode] = round(self.strategy_pnl.get(mode, 0.0) + profit, 2)
+            self.strategy_trades[mode] = int(self.strategy_trades.get(mode, 0)) + 1
+            if self.strategy_pnl[mode] <= -float(getattr(self, "strategy_budget", 100.0)):
+                self.strategy_stopped[mode] = True
+                self.note("warn", f"{mode} budget ${self.strategy_budget:.0f} spent — strategy paused")
+            try:
+                self._supa_sync_strategy_budgets()
+            except Exception:
+                pass
             if key in STRATEGIES:
                 if profit > 0:
                     self.on_win(key)
                 else:
                     self.on_loss(key)
 
+            cid = None
+            try:
+                cid = (rec or {}).get("contract_id") or (poc.get("contract_id") if isinstance(poc, dict) else None)
+            except Exception:
+                cid = None
+            if cid and getattr(self, "open_shark_legs", None):
+                self.open_shark_legs = [L for L in self.open_shark_legs if L.get("contract_id") != cid]
             self.open_contract = None
             self.open_strategy = None
 
@@ -913,6 +2117,12 @@ def run_session(bot: Bot):
     print("Connected.")
     bot.connected = True
     bot.last_error = None
+    try:
+        bot.ensure_matches()
+        bot.ensure_nextdigit()
+        bot.ensure_shark()
+    except Exception as e:
+        print(f"[engines] post-connect: {e}", flush=True)
     bot.note("info", f"Connected to Deriv ({ACCOUNT['type']} account {ACCOUNT['id']})")
     with bot.lock:
         bot.pending = False            # an unanswered proposal died with the old connection
@@ -931,6 +2141,33 @@ def run_session(bot: Bot):
         ws.send(json.dumps({"ticks": sym, "subscribe": 1}))
         print(f"  subscribed: {sym}")
 
+    # Multi-TF candles for all V75 feeds (1H bias, 15M setup, 5M entry)
+    for sym in V75_SYMBOLS:
+        for gran, label in ((300, "5M"), (900, "15M"), (3600, "1H")):
+            ws.send(json.dumps({
+                "ticks_history": sym,
+                "adjust_start_time": 1,
+                "count": 150,
+                "end": "latest",
+                "granularity": gran,
+                "style": "candles",
+                "subscribe": 1,
+            }))
+            print(f"  candles: {sym} {label} ({gran}s)")
+
+    # Prefill from Supabase then auto-backfill ~1y in background (once per process)
+    try:
+        bot.load_candles_from_supabase()
+    except Exception as e:
+        print(f"[chart] supabase prefill: {e}", flush=True)
+    try:
+        if not getattr(bot, "_history_autoload_done", False):
+            bot._history_autoload_done = True
+            bot.note("info", "Auto-loading V75 history (5M/15M/1H)…")
+            bot.fetch_v75_history(years=1.0)
+    except Exception as e:
+        print(f"[chart] auto history: {e}", flush=True)
+
     print(f"\nMode: {ACCOUNT_TYPE} | trading={'ON' if TRADING_ENABLED else 'OFF'}")
     print("Strategies: OVER (Over 0) and UNDER (Under 9), scanned at the same time")
     print(f"  OVER  barriers: {OVER_BARRIERS}")
@@ -946,6 +2183,7 @@ def run_session(bot: Bot):
     try:
         while True:
             now = time.time()
+            bot.maybe_auto_refresh_trade_limit()
             if bot.reconnect_requested:
                 bot.note("info", "Closing socket for reconnect")
                 break
@@ -1145,9 +2383,15 @@ def ensure_bot() -> None:
                     except Exception:
                         pass
         return
-    # Permanent stop and the thread has already exited — do not resurrect.
-    if BOT.stop and not (BOT.restart_at and AUTO_RESTART_AFTER_SL_TP):
+    # Permanent stops that should not auto-resurrect without user action.
+    if BOT.stop and BOT.stop_reason in ("login", "user"):
         return
+    # SL/TP wait is handled inside a living thread; if thread is dead, start fresh.
+    if BOT.stop and BOT.stop_reason == "max_trades":
+        # Soft-limit era: clear and restart so auto-refresh can run
+        BOT.stop = False
+        BOT.stop_reason = None
+        BOT.restart_at = None
     start_background_bot()
 
 # gunicorn --preload (or any os.fork) would copy the bot into the worker while
@@ -1187,7 +2431,7 @@ if hasattr(os, "register_at_fork"):
                         after_in_child=_after_fork_child)
 
 try:
-    from flask import Flask, Response, jsonify, request
+    from flask import Flask, Response, jsonify, request, send_from_directory
 except ImportError:      # plain local run without Flask
     app = None
 else:
@@ -1223,9 +2467,27 @@ else:
         resp.headers["Cache-Control"] = "no-cache"
         return resp
 
+    @app.route("/static/<path:filename>")
+    def static_files(filename):
+        static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+        return send_from_directory(static_dir, filename)
+
     @app.route("/health")
     def health():
-        return jsonify(ok=True, bot_running=bot_running())
+        store = _supa()
+        # Public diagnostics (no secrets) so connection issues are visible without STATUS_KEY
+        return jsonify(
+            ok=True,
+            bot_running=bot_running(),
+            connected=bool(getattr(BOT, "connected", False)),
+            account_type=ACCOUNT_TYPE,
+            strategy_mode=getattr(BOT, "strategy_mode", "digits"),
+            has_deriv_app_id=bool(APP_ID),
+            has_deriv_token=bool(TOKEN),
+            supabase_enabled=bool(store and getattr(store, "enabled", False)),
+            supabase_using_publishable=bool(store and getattr(store, "using_publishable", False)),
+            last_error=(getattr(BOT, "last_error", None) or None),
+        )
 
     @app.route("/api/state")
     @app.route("/status")
@@ -1268,6 +2530,75 @@ else:
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
+    @app.route("/api/history/sessions")
+    def api_history_sessions():
+        if not key_ok():
+            return jsonify(error="forbidden"), 403
+        store = _supa()
+        if store and not getattr(store, "enabled", False) and hasattr(store, "reload"):
+            store.reload()
+        if not store or not getattr(store, "enabled", False):
+            return jsonify(
+                enabled=False, sessions=[],
+                message="Supabase not configured on server. Set SUPABASE_URL and SUPABASE_SECRET_KEY on Render, then restart.",
+            )
+        at = (request.args.get("account_type") or "").strip().lower()
+        if at not in ("demo", "real"):
+            at = None
+        try:
+            limit = int(request.args.get("limit") or 30)
+        except ValueError:
+            limit = 30
+        rows = _supa().list_sessions(account_type=at, limit=limit)
+        return jsonify(enabled=True, account_type=at or "all", sessions=rows)
+
+    @app.route("/api/history/trades")
+    def api_history_trades():
+        if not key_ok():
+            return jsonify(error="forbidden"), 403
+        store = _supa()
+        if store and not getattr(store, "enabled", False) and hasattr(store, "reload"):
+            store.reload()
+        if not store or not getattr(store, "enabled", False):
+            return jsonify(
+                enabled=False, trades=[],
+                message="Supabase not configured on server. Set SUPABASE_URL and SUPABASE_SECRET_KEY on Render, then restart.",
+            )
+        at = (request.args.get("account_type") or "").strip().lower()
+        if at not in ("demo", "real"):
+            at = None
+        sid = (request.args.get("session_id") or "").strip() or None
+        try:
+            limit = int(request.args.get("limit") or 50)
+        except ValueError:
+            limit = 50
+        rows = _supa().list_trades(account_type=at, session_id=sid, limit=limit)
+        return jsonify(enabled=True, account_type=at or "all", session_id=sid, trades=rows)
+
+    @app.route("/api/history/strategy_budgets")
+    def api_history_strategy_budgets():
+        if not key_ok():
+            return jsonify(error="forbidden"), 403
+        store = _supa()
+        if store and not getattr(store, "enabled", False) and hasattr(store, "reload"):
+            store.reload()
+        if not store or not getattr(store, "enabled", False):
+            return jsonify(enabled=False, budgets=[], message="Supabase not configured")
+        at = (request.args.get("account_type") or "").strip().lower()
+        if at not in ("demo", "real"):
+            at = ACCOUNT_TYPE if ACCOUNT_TYPE in ("demo", "real") else None
+        sid = (request.args.get("session_id") or "").strip() or None
+        rows = []
+        if hasattr(store, "list_strategy_budgets"):
+            rows = store.list_strategy_budgets(account_type=at, session_id=sid, limit=50)
+        # Also return live bot view
+        live = {}
+        try:
+            live = (BOT.snapshot(bot_running(), bool(os.environ.get("STATUS_KEY"))) or {}).get("strategies_ui") or {}
+        except Exception:
+            live = {}
+        return jsonify(enabled=True, budgets=rows, live=live)
+
     @app.route("/api/control", methods=["POST"])
     def api_control():
         """Dashboard auto-trade controls: pause, resume, stop, force, reset_stats, reset_session."""
@@ -1282,10 +2613,11 @@ else:
                       request.form.get("skip_filter")))
         if isinstance(skip_filter, str):
             skip_filter = skip_filter.strip().lower() in ("1", "true", "yes", "on")
+        mode = data.get("mode") or request.form.get("mode")
         result = BOT.control(action, symbol=symbol, strategy=strategy,
-                             skip_filter=bool(skip_filter))
-        if action in ("reconnect", "restart_bot"):
-            # If the bot thread exited (e.g. after login failure), start it again.
+                             skip_filter=bool(skip_filter), mode=mode)
+        if action in ("reconnect", "restart_bot", "refresh_limit", "reset_trades", "refresh_trades", "resume"):
+            # If the bot thread exited, start it again so trading can continue.
             ensure_bot()
             if not bot_running():
                 start_background_bot()
